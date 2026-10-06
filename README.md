@@ -1,3 +1,10 @@
+# Heinteira Frame — Heinteira Studio
+
+Adaptação para macOS Intel por Alessandro Henriques Teixeira, baseada no Drift / CutWire Studios. Créditos e licença GPL-3.0-or-later preservados.
+
+Este repositório foi renomeado de ArnFrame. As informações abaixo descrevem a base original Drift; seus downloads não são builds do Heinteira Frame.
+
+
 <p align="center">
   <img src="Drift_icon.png" alt="Drift icon" width="128" height="128">
 </p>

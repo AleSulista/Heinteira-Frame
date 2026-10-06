@@ -47,7 +47,7 @@ option(DRIFT_AUTO_UPDATE_TRANSLATIONS "Run lupdate as part of the default build"
 # Where the Addon Manager fetches from. These are the only place either value is defined —
 # src/models/AddonEndpoint.h just reads them — so a fork can point at its own Worker with:
 #
-#   cmake -B build -DDRIFT_ADDON_INDEX_URL=https://addons.example.com/v1/index \
+#   cmake -B build -DDRIFT_ADDON_INDEX_URL=@@HOLD0@@ \
 #                  -DDRIFT_ADDON_CLIENT_TOKEN=...
 #
 # Set DRIFT_ADDON_INDEX_URL to an empty string to build with the addon service disabled: the
@@ -57,7 +57,7 @@ option(DRIFT_AUTO_UPDATE_TRANSLATIONS "Run lupdate as part of the default build"
 # The token is NOT a secret. It ships inside every binary and is trivially extractable; it exists
 # so the bucket cannot be crawled or hotlinked, which would cost operations for someone else's
 # benefit. That is also why it is fine in CMakeCache.txt.
-set(DRIFT_ADDON_INDEX_URL "https://drift-addons.cutwire.org/v1/index"
+set(DRIFT_ADDON_INDEX_URL "@@HOLD1@@"
     CACHE STRING "Addon index endpoint; empty disables the addon service")
 set(DRIFT_ADDON_CLIENT_TOKEN "79a388bba9301cacc81cc6eb0724c81e948e1b27c69aee1b"
     CACHE STRING "Client token sent to the addon service as X-Drift-Client")
@@ -70,7 +70,7 @@ set(DRIFT_ADDON_CLIENT_TOKEN "79a388bba9301cacc81cc6eb0724c81e948e1b27c69aee1b"
 # Set it to an empty string for builds a package manager owns — the Flatpak manifests and the Arch
 # PKGBUILD all do. There, pacman or flatpak fetches the update on its own schedule and an in-app
 # nag is noise the user cannot act on (Flathub's quality guidelines say as much).
-set(DRIFT_UPDATE_FEED_URL "https://api.github.com/repos/CutWire-Studios/Drift/releases/latest"
+set(DRIFT_UPDATE_FEED_URL "@@HOLD2@@"
     CACHE STRING "Release feed polled for updates; empty disables the update check")
 
 find_package(Qt6 6.5 REQUIRED COMPONENTS Quick QuickControls2 Multimedia Test Concurrent Widgets OpenGL Network QuickEffects Svg)
@@ -273,14 +273,14 @@ endif()
 # Drift links exactly one JUCE module and calls none of JUCE's project helpers, so everything past
 # add_subdirectory(modules) is dead weight: it configures and builds juceaide, and — the part that
 # actually leaks — adds install() rules that drop JUCE's headers, its LV2 helper binary and its
-# CMake package config into any `cmake --install` prefix, i.e. into the AppImage and the distro
+# CMake package config into any @@HOLD3@@ prefix, i.e. into the AppImage and the distro
 # package. FORCE because it has to win over JUCE's own option() default either way it is acquired.
 set(JUCE_MODULES_ONLY ON CACHE BOOL "Only configure the JUCE modules" FORCE)
 
 option(DRIFT_FETCH_JUCE "Download JUCE when DRIFT_JUCE_DIR is not set" ON)
 # STRING, not PATH, on purpose: CMake rewrites a relative PATH cache entry to an absolute one
 # against the working directory of the cmake invocation — the *build* directory. The manifests
-# vendor JUCE next to CMakeLists.txt and pass `-DDRIFT_JUCE_DIR=juce`, which a PATH would resolve
+# vendor JUCE next to CMakeLists.txt and pass @@HOLD4@@, which a PATH would resolve
 # to <build>/juce and fail. As a STRING the value arrives verbatim and is resolved below, against
 # the source tree, which is what a relative path here can only sensibly mean.
 set(DRIFT_JUCE_DIR "" CACHE STRING
@@ -304,7 +304,7 @@ elseif(DRIFT_FETCH_JUCE)
     message(STATUS "JUCE: fetching ${DRIFT_JUCE_TAG}")
     include(FetchContent)
     FetchContent_Declare(JUCE
-        GIT_REPOSITORY https://github.com/juce-framework/JUCE.git
+        GIT_REPOSITORY @@HOLD5@@
         GIT_TAG ${DRIFT_JUCE_TAG}
         GIT_SHALLOW TRUE
         GIT_PROGRESS TRUE)
@@ -641,7 +641,7 @@ endif()
 # It also collides with the <build>/Drift/ directory qt_add_qml_module(URI Drift) writes, which
 # on case-insensitive APFS fails the link with EISDIR.
 if(APPLE)
-    set(DRIFT_MACOS_EXECUTABLE "ArnFrame")
+    set(DRIFT_MACOS_EXECUTABLE "Heinteira Frame")
     set(DRIFT_MACOS_BUNDLE_ID "studio.arn.ArnFrame")
     set(DRIFT_MACOS_ICON_FILE "ArnFrame.icns")
 
@@ -873,7 +873,7 @@ if(ANDROID)
             "Missing OpenSSL shared libs for Qt Network TLS under ${DRIFT_PREBUILT}/lib.\n"
             "Expected libcrypto_3.so and libssl_3.so (KDAB android_openssl ssl_3 layout).\n"
             "Rebuild deps with third_party/build-android.sh ${ANDROID_ABI}, or copy the\n"
-            "ssl_3/${ANDROID_ABI}/*.so files from https://github.com/KDAB/android_openssl.")
+            "ssl_3/${ANDROID_ABI}/*.so files from @@HOLD6@@")
     endif()
 
     set(DRIFT_ANDROID_PACKAGE_NAME "org.cutwire.drift" CACHE STRING
@@ -973,8 +973,8 @@ target_compile_definitions(drift PRIVATE
 #
 # Several targets share one output directory (everything under tools/, the two engine tests), so
 # the copy is registered once per destination and depended on, rather than as a POST_BUILD step per
-# target: two `cmake -E copy_directory` processes writing the same tree concurrently — which is
-# what `cmake --build --parallel` does — fail with "Error copying directory".
+# target: two @@HOLD7@@ processes writing the same tree concurrently — which is
+# what @@HOLD8@@ does — fail with "Error copying directory".
 function(drift_stage_packages target assetdir)
     # Only drift is a bundle, so the shared output directory guarded against below cannot happen.
     get_target_property(_bundle ${target} MACOSX_BUNDLE)
@@ -1067,8 +1067,8 @@ if(NOT ANDROID)
 include(GNUInstallDirs)
 
 # Everything Drift installs is tagged with the "drift" component, so packaging can ask for the app
-# and nothing else: `cmake --install build --component drift`. JUCE's modules install ~50 MB of
-# their own sources into include/JUCE-<version>, and a plain `cmake --install` has no way to say no
+# and nothing else: @@HOLD9@@. JUCE's modules install ~50 MB of
+# their own sources into include/JUCE-<version>, and a plain @@HOLD10@@ has no way to say no
 # to them. (The Flatpak manifests get the same result the other way round, by cleaning up /include.)
 if(APPLE)
     # The bundle is complete after the build. Use -DCMAKE_INSTALL_PREFIX=/Applications.

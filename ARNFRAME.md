@@ -1,20 +1,20 @@
-# ArnFrame by Studio Arn
+# Heinteira Frame by Heinteira Studio
 
-ArnFrame is a macOS Intel adaptation of the open-source Drift video editor.
+Heinteira Frame is a macOS Intel adaptation of the open-source Drift video editor.
 
 ## Credits
 
-- Intel adaptation, visual identity, and project direction: **Alessandro Henriques Teixeira — Studio Arn**
+- Intel adaptation, visual identity, and project direction: **Alessandro Henriques Teixeira — Heinteira Studio**
 - Original project: **Drift**, developed by **CutWire Studios**
 - License: **GNU General Public License v3.0 or later**
 
-ArnFrame is an independent derivative and is not an official CutWire Studios release. The
+Heinteira Frame is an independent derivative and is not an official CutWire Studios release. The
 original copyright notices and GPLv3 license remain in place. Source code for this derivative is
 distributed with the same license.
 
 ## Intel build
 
-This branch targets Intel `x86_64` Macs. ArnFrame includes a native macOS Intel build of ONNX
+This branch targets Intel `x86_64` Macs. Heinteira Frame includes a native macOS Intel build of ONNX
 Runtime 1.27.0 and its required Protobuf Lite library.
 
 The bundled runtime enables local AI features such as face detection, object segmentation,
@@ -29,7 +29,7 @@ older Intel Macs, especially when analysing long or high-resolution videos.
 
 ## Versão para macOS Intel
 
-O ArnFrame inclui o ONNX Runtime 1.27.0 compilado nativamente para processadores Intel `x86_64`,
+O Heinteira Frame inclui o ONNX Runtime 1.27.0 compilado nativamente para processadores Intel `x86_64`,
 permitindo utilizar os recursos locais de inteligência artificial quando os respectivos modelos
 estiverem instalados.
 

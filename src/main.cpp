@@ -181,8 +181,8 @@ int main(int argc, char *argv[])
     for (int i = 1; i < argc; ++i) {
         if (qstrcmp(argv[i], "--mcp-stdio") == 0) {
             QCoreApplication app(argc, argv);
-            QCoreApplication::setApplicationName("ArnFrame");
-            QCoreApplication::setOrganizationName("Studio Arn");
+            QCoreApplication::setApplicationName("Heinteira Frame");
+            QCoreApplication::setOrganizationName("Heinteira Studio");
             return drift::mcp::runStdioAttach();
         }
     }
@@ -224,8 +224,8 @@ int main(int argc, char *argv[])
 
     // Names must be set before reading QSettings for ui/scale, and QT_SCALE_FACTOR
     // must be in the environment before QApplication is constructed.
-    QCoreApplication::setApplicationName("ArnFrame");
-    QCoreApplication::setOrganizationName("Studio Arn");
+    QCoreApplication::setApplicationName("Heinteira Frame");
+    QCoreApplication::setOrganizationName("Heinteira Studio");
     AppController::applyStoredUiScale();
     // Qt's xcb plugin defaults to GLX, so eglGetCurrentDisplay() is null and
     // zero-copy sticky-disables. Only force EGL when the user opted in — default
