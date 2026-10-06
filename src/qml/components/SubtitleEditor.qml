@@ -22,7 +22,7 @@ Item {
     readonly property int selectedCueIndex: EditorState.selectedSubtitleCue
 
     readonly property double localPlayhead: {
-        void EditorState.playheadSeconds
+        void EditorState.inspectorPlayheadSeconds
         void root.clip
         return clip ? EditorState.subtitleLocalPlayheadSeconds(trackIndex, clipIndex) : -1
     }
@@ -342,15 +342,23 @@ Item {
                         "srt")
                     if (url != "")
                         EditorState.exportSubtitleFile(
-                            root.trackIndex, root.clipIndex, url)
+                            root.trackIndex, root.clipIndex, url, timelineTimesBox.checked)
                 }
             }
+        }
+
+        ThemedCheckBox {
+            id: timelineTimesBox
+            width: parent.width
+            text: qsTr("Timestamps from the start of the video")
+            tooltip: qsTr("Offset the exported captions by this clip's start so they match the exported video")
         }
     }
 
     // ---- Lyrics list (compact, keeps neighbours in view) -----------------------
     ListView {
         id: listView
+        reuseItems: true
         anchors.top: header.bottom
         anchors.topMargin: 8
         anchors.bottom: editorPanel.top
@@ -388,9 +396,12 @@ Item {
                 width: parent.width
                 height: lineCol.implicitHeight + 14
                 radius: Theme.radiusMd
-                color: cueDelegate.isSelected ? Theme.panelAccent : "transparent"
-                border.width: (cueDelegate.isSelected || cueDelegate.isActive) ? 1 : 0
-                border.color: cueDelegate.isActive ? Theme.clipSubtitle : Theme.panelBorder
+                color: cueDelegate.isSelected ? Theme.panelAccent : (rowHover.containsMouse ? Theme.panelAccent : "transparent")
+                border.width: (cueDelegate.isSelected || cueDelegate.isActive || rowHover.containsMouse) ? 1 : 0
+                border.color: cueDelegate.isActive ? Theme.clipSubtitle : (cueDelegate.isSelected ? Theme.panelBorder : (rowHover.containsMouse ? Theme.panelBorder : "transparent"))
+
+                Behavior on color { ColorAnimation { duration: Theme.durationFast } }
+                Behavior on border.color { ColorAnimation { duration: Theme.durationFast } }
 
                 MouseArea {
                     id: rowHover
@@ -415,7 +426,8 @@ Item {
                         color: Theme.mutedForeground
                         font.family: Theme.monoFontFamily
                         font.pixelSize: Theme.fontSizeXs
-                        opacity: (cueDelegate.isActive || cueDelegate.isSelected) ? 0.9 : 0.4
+                        opacity: (cueDelegate.isActive || cueDelegate.isSelected) ? 0.95 : (rowHover.containsMouse ? 0.85 : 0.65)
+                        Behavior on opacity { NumberAnimation { duration: 150 } }
                     }
 
                     Text {
@@ -428,8 +440,8 @@ Item {
                         font.weight: cueDelegate.isActive ? Font.DemiBold : Font.Normal
                         font.italic: !(cueDelegate.modelData.text && cueDelegate.modelData.text.length)
                         color: cueDelegate.isActive ? Theme.clipSubtitle
-                               : (cueDelegate.isSelected ? Theme.panelForeground : Theme.mutedForeground)
-                        opacity: cueDelegate.isActive ? 1.0 : (cueDelegate.isSelected ? 0.95 : 0.5)
+                               : (cueDelegate.isSelected || rowHover.containsMouse ? Theme.panelForeground : Theme.foreground)
+                        opacity: (cueDelegate.isActive || cueDelegate.isSelected) ? 1.0 : (rowHover.containsMouse ? 0.95 : 0.82)
                         Behavior on opacity { NumberAnimation { duration: 200 } }
                         Behavior on color { ColorAnimation { duration: 200 } }
                     }

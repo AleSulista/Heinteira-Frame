@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QString>
+#include <QStringList>
 #include <QVariantList>
 #include <QVector>
 
@@ -23,14 +24,31 @@ public:
     // Decodes the whole file, so cost scales with duration — prefer peaksForRange() for
     // anything that only needs part of a long source.
     static Dense densePeaks(const QString &sourcePath, int peaksPerSecond = 100,
-                            int maxPeaks = 1 << 20);
+                            int maxPeaks = 1 << 20, int streamOrdinal = 0);
 
     // Peaks for [startSeconds, endSeconds) only. Seeks first, so the cost is proportional to
     // the span asked for rather than to the file length. Returns exactly
     // ceil((end - start) * peaksPerSecond) values, or empty if nothing decoded (past the end
     // of the media, no audio stream, unreadable file).
     static QVector<float> peaksForRange(const QString &sourcePath, double startSeconds,
-                                        double endSeconds, int peaksPerSecond);
+                                        double endSeconds, int peaksPerSecond, int streamOrdinal = 0);
+
+    // Per-channel peaks over the same window, one vector per decoded channel, plus the
+    // layout's short channel names ("FL", "FR", "FC", "LFE", ...).
+    //
+    // One decode feeds every channel: the samples are already read to build the merged
+    // envelope peaksForRange returns, so N lanes cost the same I/O and codec time as one.
+    // An empty `channels` means nothing decoded — the same signal peaksForRange gives by
+    // returning {}.
+    struct PerChannel
+    {
+        QVector<QVector<float>> channels; // channels[channel][bucket]
+        QStringList channelNames;         // parallel to `channels` when the layout is known
+    };
+
+    static PerChannel peaksForRangePerChannel(const QString &sourcePath, double startSeconds,
+                                              double endSeconds, int peaksPerSecond,
+                                              int streamOrdinal = 0);
 
     // Writes up to `maxFrames` frames of interleaved-stereo float PCM starting `frameOffset`
     // frames into the span, and returns how many it wrote. Return 0 to stop early.

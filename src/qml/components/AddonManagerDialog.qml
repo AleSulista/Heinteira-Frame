@@ -47,6 +47,103 @@ ThemedDialog {
         onRejected: root.pendingRemovalId = ""
     }
 
+    // A .driftfx from Drift Forge. Nothing signs these, so the user confirms before it installs.
+    property var pendingUserPackage: ({})
+    // A .driftpkg or .zip. Installs without asking only when the Drift team signed it.
+    property var pendingAddonFile: ({})
+
+    function importUserPackage(url) {
+        if (!url || String(url) === "")
+            url = FileDialogs.openFile(qsTr("Install Addon"),
+                                       [qsTr("Drift addons (*.driftpkg *.driftfx *.zip)")])
+        if (!url || String(url) === "")
+            return
+        const info = Addons.inspectAddonFile(url)
+        if (info.error) {
+            Toasts.error(info.error)
+            return
+        }
+        if (!root.visible)
+            root.open()
+        if (info.type === "driftfx") {
+            root.pendingUserPackage = info
+            confirmUserPackage.open()
+            return
+        }
+        root.pendingAddonFile = info
+        Addons.installAddonFile(false)
+    }
+
+    ThemedDialog {
+        id: confirmUnverified
+        title: qsTr("Install an unofficial addon?")
+        acceptText: qsTr("Install anyway")
+        acceptVariant: root.pendingAddonFile.nativeCode ? "destructive" : "primary"
+        preferredWidth: Theme.dialogWidthSm
+        acceptOnReturn: false
+
+        contentItem: ThemedLabel {
+            width: parent ? parent.width : Theme.dialogWidthSm
+            wrapMode: Text.WordWrap
+            size: "sm"
+            text: {
+                const p = root.pendingAddonFile
+                const by = p.author ? qsTr("“%1” by %2").arg(p.name).arg(p.author) : qsTr("“%1”").arg(p.name)
+                var lines = [qsTr("%1 is not signed by the Drift team. Only install files you trust.").arg(by)]
+                if (p.nativeCode)
+                    lines.push(qsTr("It contains code that runs on your computer."))
+                if (p.replaces)
+                    lines.push(qsTr("It will replace “%1”.").arg(p.replaces))
+                return lines.join("\n\n")
+            }
+        }
+
+        onAccepted: Addons.installAddonFile(true)
+        onRejected: {
+            Addons.discardAddonFile()
+            root.pendingAddonFile = {}
+        }
+    }
+
+    ThemedDialog {
+        id: confirmUserPackage
+        title: root.pendingUserPackage.kind === "transitions" ? qsTr("Install this transition?")
+               : root.pendingUserPackage.kind === "audio-effects" ? qsTr("Install this audio effect?")
+                                                                   : qsTr("Install this effect?")
+        acceptText: qsTr("Install")
+        preferredWidth: Theme.dialogWidthSm
+
+        contentItem: ThemedLabel {
+            width: parent ? parent.width : Theme.dialogWidthSm
+            wrapMode: Text.WordWrap
+            size: "sm"
+            text: {
+                const p = root.pendingUserPackage
+                const by = p.author ? qsTr("“%1” by %2").arg(p.name).arg(p.author) : qsTr("“%1”").arg(p.name)
+                return qsTr("%1 was made by a user, not the Drift team, and nothing has checked it. Only install files you trust.").arg(by)
+            }
+        }
+
+        onAccepted: {
+            Addons.installUserPackage()
+            root.pendingUserPackage = {}
+        }
+        onRejected: root.pendingUserPackage = {}
+    }
+
+    Connections {
+        target: Addons
+        function onAddonFileNeedsConfirmation() {
+            confirmUnverified.open()
+        }
+        function onUserPackageInstalled(name, error) {
+            if (error.length > 0)
+                Toasts.error(qsTr("Could not install “%1”: %2").arg(name).arg(error))
+            else
+                Toasts.success(qsTr("Installed “%1”").arg(name))
+        }
+    }
+
     ThemedDialog {
         id: detailsDialog
         title: root.detailsName
@@ -94,10 +191,13 @@ ThemedDialog {
             root.kindFilterKinds = ["onnxruntime", "onnxruntime-ep"]
         } else if (kind === "whisper-model" || kind === "denoise-model"
                    || kind === "sam2-model" || kind === "face-model"
-                   || kind === "object-model") {
+                   || kind === "object-model" || kind === "vad-model"
+                   || kind === "align-model" || kind === "diarize-model"
+                   || kind === "depth-model" || kind === "restore-model") {
             root.kindFilter = "whisper-model"
             root.kindFilterKinds = ["whisper-model", "denoise-model", "sam2-model", "face-model",
-                                    "object-model"]
+                                    "object-model", "vad-model", "align-model", "diarize-model",
+                                    "depth-model", "restore-model"]
         } else if (kind === "effects" || kind === "effect-templates") {
             root.kindFilter = "effects"
             root.kindFilterKinds = ["effects"]
@@ -121,7 +221,10 @@ ThemedDialog {
         return Math.max(1, Math.round(bytes / 1e3)) + " KB"
     }
 
-    onOpened: Addons.refresh(true)
+    onOpened: {
+        Addons.rescanCustomAddons()
+        Addons.refresh(true)
+    }
 
     Connections {
         target: Addons
@@ -157,9 +260,11 @@ ThemedDialog {
                     { id: "stickers", label: qsTr("Stickers"), kinds: ["stickers"] },
                     { id: "whisper-model", label: qsTr("AI tools"),
                       kinds: ["whisper-model", "denoise-model", "sam2-model", "face-model",
-                              "object-model"] },
+                              "object-model", "vad-model", "align-model", "diarize-model",
+                              "depth-model", "restore-model"] },
                     { id: "onnxruntime", label: qsTr("AI engine"),
-                      kinds: ["onnxruntime", "onnxruntime-ep"] }
+                      kinds: ["onnxruntime", "onnxruntime-ep"] },
+                    { id: "custom", label: qsTr("Custom"), kinds: [] }
                 ]
 
                 ThemedChip {
@@ -170,6 +275,21 @@ ThemedDialog {
                         root.kindFilterKinds = modelData.kinds
                     }
                 }
+            }
+
+            ThemedButton {
+                text: qsTr("Install from file…")
+                variant: "ghost"
+                onClicked: root.importUserPackage("")
+            }
+
+            // Android keeps the folder inside the app's private storage, out of a file manager's reach.
+            ThemedButton {
+                visible: Qt.platform.os !== "android"
+                text: qsTr("Open addons folder")
+                variant: "ghost"
+                tooltip: qsTr("Put addon folders here, then reopen Extras")
+                onClicked: Qt.openUrlExternally(Addons.customAddonsFolderUrl())
             }
         }
 
@@ -271,6 +391,8 @@ ThemedDialog {
             model: Addons.catalog.filter(function (addon) {
                 if (root.kindFilter === "all")
                     return true
+                if (root.kindFilter === "custom")
+                    return !!addon.custom
                 var wanted = root.kindFilterKinds
                 if (!wanted || wanted.length === 0)
                     wanted = [root.kindFilter]
@@ -421,7 +543,19 @@ ThemedDialog {
                                                       .arg(Math.round(row.transfer.fraction * 100))
                             if (row.modelData.state === "failed")
                                 return row.modelData.error
-                            var parts = [qsTr("%1 download").arg(root.formatSize(row.modelData.downloadSize))]
+                            if (row.modelData.state === "needs-newer-app")
+                                return qsTr("Requires Drift %1 or newer").arg(row.modelData.minAppVersion)
+                            var parts = []
+                            if (row.modelData.unofficial)
+                                parts.push(qsTr("Unofficial"))
+                            if (row.modelData.custom) {
+                                if (!row.modelData.unofficial)
+                                    parts.push(qsTr("Installed from file"))
+                                if (row.modelData.installedSize > 0)
+                                    parts.push(root.formatSize(row.modelData.installedSize))
+                                return parts.join(" · ")
+                            }
+                            parts.push(qsTr("%1 download").arg(root.formatSize(row.modelData.downloadSize)))
                             if (row.modelData.items > 0)
                                 parts.push(qsTr("%1 items").arg(row.modelData.items))
                             if (row.modelData.license.length > 0)
@@ -474,6 +608,7 @@ ThemedDialog {
                     ThemedButton {
                         anchors.verticalCenter: parent.verticalCenter
                         visible: !row.active && row.modelData.state !== "installed"
+                                 && row.modelData.state !== "needs-newer-app"
                         text: row.modelData.state === "update-available" ? qsTr("Update")
                             : row.modelData.state === "failed" ? qsTr("Retry")
                             : qsTr("Install")

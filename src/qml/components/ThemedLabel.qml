@@ -11,5 +11,7 @@ Text {
     font.family: Theme.fontFamily
     font.pixelSize: size === "base" ? Theme.fontSizeBase
                      : (size === "sm" ? Theme.fontSizeSm : Theme.fontSizeXs)
+    style: Theme.glassMode ? Text.Raised : Text.Normal
+    styleColor: Theme.darkMode ? "#80000000" : "#b0ffffff"
     wrapMode: Text.WordWrap
 }

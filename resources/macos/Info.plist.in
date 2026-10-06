@@ -13,11 +13,13 @@
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
-    <string>Heinteira Frame</string>
+    <string>@DRIFT_APP_NAME@</string>
     <key>CFBundleDisplayName</key>
-    <string>Heinteira Frame</string>
+    <string>@DRIFT_APP_NAME@</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
+    <!-- Deliberately @PROJECT_VERSION@ and not the nightly version string: Apple's tooling wants a
+         plain dotted release version here. A nightly is told apart by its bundle id and name. -->
     <key>CFBundleShortVersionString</key>
     <string>@PROJECT_VERSION@</string>
     <key>CFBundleVersion</key>
@@ -46,7 +48,7 @@
             <string>Owner</string>
             <key>LSItemContentTypes</key>
             <array>
-                <string>studio.arn.arnframe.project</string>
+                <string>studio.heinteira.frame.project</string>
             </array>
         </dict>
     </array>
@@ -54,7 +56,7 @@
     <array>
         <dict>
             <key>UTTypeIdentifier</key>
-            <string>studio.arn.arnframe.project</string>
+            <string>studio.heinteira.frame.project</string>
             <key>UTTypeDescription</key>
             <string>Heinteira Frame Project</string>
             <key>UTTypeConformsTo</key>
@@ -68,6 +70,19 @@
                     <string>drift</string>
                 </array>
             </dict>
+        </dict>
+    </array>
+    <key>CFBundleURLTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleURLName</key>
+            <string>org.cutwire.drift.market</string>
+            <key>CFBundleURLSchemes</key>
+            <array>
+                <string>cutwire</string>
+            </array>
+            <key>CFBundleTypeRole</key>
+            <string>Editor</string>
         </dict>
     </array>
 </dict>

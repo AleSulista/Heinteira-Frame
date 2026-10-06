@@ -1,9 +1,11 @@
 #include "AddonPackage.h"
 
 #include "AddonSigningKey.h"
+#include "models/VersionCompare.h"
 
 #include <QCryptographicHash>
 #include <QDir>
+#include <QDirIterator>
 #include <QFile>
 #include <QFileInfo>
 #include <QJsonArray>
@@ -18,6 +20,7 @@ namespace drift::addon {
 namespace {
 
 constexpr char kMagic[8] = {'D', 'R', 'I', 'F', 'T', 'P', 'K', 'G'};
+constexpr char kUserMagic[8] = {'D', 'R', 'I', 'F', 'T', 'F', 'X', '\0'};
 constexpr quint32 kFormatVersion = 1;
 constexpr int kHeaderSize = 16;  // magic + version + metadataLength
 constexpr int kSizesSize = 16;   // payloadCompressed + payloadRaw
@@ -25,11 +28,24 @@ constexpr int kDigestSize = 32;  // SHA-256
 constexpr int kSignatureSize = 64; // Ed25519
 constexpr quint32 kMaxMetadataSize = 64u * 1024 * 1024;
 constexpr qint64 kChunkSize = 1 << 20;
+constexpr quint64 kMaxUserPayload = 256ull * 1024 * 1024; // Forge refuses to export more
 
 quint32 readU32(const char *p)
 {
     const auto *b = reinterpret_cast<const quint8 *>(p);
     return quint32(b[0]) | (quint32(b[1]) << 8) | (quint32(b[2]) << 16) | (quint32(b[3]) << 24);
+}
+
+void appendU32(QByteArray *out, quint32 v)
+{
+    for (int i = 0; i < 4; ++i)
+        out->append(char((v >> (8 * i)) & 0xff));
+}
+
+void appendU64(QByteArray *out, quint64 v)
+{
+    for (int i = 0; i < 8; ++i)
+        out->append(char((v >> (8 * i)) & 0xff));
 }
 
 quint64 readU64(const char *p)
@@ -65,7 +81,7 @@ bool safeRelativePath(const QString &path)
     return true;
 }
 
-bool parseMetadata(const QByteArray &json, PackageInfo *info, QString *error)
+bool parseMetadata(const QByteArray &json, PackageInfo *info, QString *error, bool requireFiles = true)
 {
     QJsonParseError parseError;
     const QJsonDocument doc = QJsonDocument::fromJson(json, &parseError);
@@ -125,20 +141,51 @@ bool parseMetadata(const QByteArray &json, PackageInfo *info, QString *error)
         expectedOffset += file.size;
         info->files.append(file);
     }
-    if (info->files.isEmpty())
+    if (requireFiles && info->files.isEmpty())
         return fail(error, QStringLiteral("metadata lists no files"));
 
     return true;
 }
 
-// Read the fixed header and the metadata block, leaving `file` positioned at payloadCompressed.
-bool readHeader(QFile &file, PackageInfo *info, QCryptographicHash *digest, QString *error)
+bool checkUserLayout(const PackageInfo &info, QString *error)
 {
+    if (info.provides.size() != 1)
+        return fail(error, QStringLiteral("a user package must provide exactly one item"));
+    const PackageProvide &provide = info.provides.first();
+    // Audio effects are safe to sideload: a package only names one of the built-in processors and
+    // sets its parameters, so it carries no code.
+    if (provide.kind != QLatin1String("effects") && provide.kind != QLatin1String("transitions")
+        && provide.kind != QLatin1String("audio-effects")) {
+        return fail(error, QStringLiteral("a user package can only provide an effect, a transition or an audio effect"));
+    }
+
+    const QString rootPrefix = provide.root + QLatin1Char('/');
+    QString folder;
+    for (const PackageFile &file : info.files) {
+        const QString rest = file.path.startsWith(rootPrefix) ? file.path.mid(rootPrefix.size()) : QString();
+        const QString first = rest.section(QLatin1Char('/'), 0, 0);
+        if (first.isEmpty() || first == rest)
+            return fail(error, QStringLiteral("unexpected file outside the package folder: %1").arg(file.path));
+        if (folder.isEmpty())
+            folder = first;
+        else if (first != folder)
+            return fail(error, QStringLiteral("a user package must contain a single folder"));
+    }
+    return true;
+}
+
+// Read the fixed header and the metadata block, leaving `file` positioned at payloadCompressed.
+bool readHeader(QFile &file, PackageInfo *info, QCryptographicHash *digest, QString *error,
+                Container container)
+{
+    const bool user = container == Container::User;
     QByteArray header = file.read(kHeaderSize);
     if (header.size() != kHeaderSize)
-        return fail(error, QStringLiteral("file is too short to be a .driftpkg"));
-    if (memcmp(header.constData(), kMagic, sizeof(kMagic)) != 0)
-        return fail(error, QStringLiteral("not a .driftpkg (bad magic)"));
+        return fail(error, user ? QStringLiteral("file is too short to be a .driftfx")
+                                : QStringLiteral("file is too short to be a .driftpkg"));
+    if (memcmp(header.constData(), user ? kUserMagic : kMagic, sizeof(kMagic)) != 0)
+        return fail(error, user ? QStringLiteral("not a .driftfx (bad magic)")
+                                : QStringLiteral("not a .driftpkg (bad magic)"));
 
     const quint32 version = readU32(header.constData() + 8);
     if (version != kFormatVersion) {
@@ -159,7 +206,9 @@ bool readHeader(QFile &file, PackageInfo *info, QCryptographicHash *digest, QStr
         digest->addData(header);
         digest->addData(metadata);
     }
-    return parseMetadata(metadata, info, error);
+    if (!parseMetadata(metadata, info, error))
+        return false;
+    return !user || checkUserLayout(*info, error);
 }
 
 // Writes the decompressed byte stream out across the file table, hashing each file as it closes.
@@ -301,7 +350,7 @@ QString currentPlatform()
     return os + QLatin1Char('-') + arch;
 }
 
-std::optional<PackageInfo> readManifest(const QString &packagePath, QString *error)
+std::optional<PackageInfo> readManifest(const QString &packagePath, QString *error, Container container)
 {
     QFile file(packagePath);
     if (!file.open(QIODevice::ReadOnly)) {
@@ -310,30 +359,112 @@ std::optional<PackageInfo> readManifest(const QString &packagePath, QString *err
     }
 
     PackageInfo info;
-    if (!readHeader(file, &info, nullptr, error))
+    if (!readHeader(file, &info, nullptr, error, container))
         return std::nullopt;
     return info;
 }
 
-bool install(const QString &packagePath, const QString &destDir, const ProgressFn &progress,
-             PackageInfo *installed, QString *error)
+bool checkCompatible(const PackageInfo &info, QString *error)
 {
+    // A native-code package built for another platform installs perfectly and then fails to load,
+    // which is a much harder thing to explain than a refusal.
+    if (!info.platform.isEmpty() && info.platform != currentPlatform()) {
+        return fail(error, QStringLiteral("%1 is built for %2, but this is %3")
+                               .arg(info.id, info.platform, currentPlatform()));
+    }
+    if (!info.minAppVersion.isEmpty() && drift::compareVersions(QStringLiteral(DRIFT_VERSION), info.minAppVersion) < 0) {
+        return fail(error, QStringLiteral("%1 requires Drift %2 or newer, but this is %3")
+                               .arg(info.id, info.minAppVersion, QStringLiteral(DRIFT_VERSION)));
+    }
+    return true;
+}
+
+std::optional<PackageInfo> parseFolderManifest(const QByteArray &json, QString *error)
+{
+    PackageInfo info;
+    if (!parseMetadata(json, &info, error, false))
+        return std::nullopt;
+    // The id names the folder it is installed into, so it must stay one path component.
+    if (!safeRelativePath(info.id) || info.id.contains(QLatin1Char('/'))) {
+        fail(error, QStringLiteral("invalid addon id: %1").arg(info.id));
+        return std::nullopt;
+    }
+    return info;
+}
+
+bool hasNativeCode(const PackageInfo &info)
+{
+    for (const PackageProvide &provide : info.provides) {
+        if (provide.kind == QLatin1String("onnxruntime") || provide.kind == QLatin1String("onnxruntime-ep"))
+            return true;
+    }
+    return false;
+}
+
+SignatureCheck checkSignature(const QString &packagePath, QString *error)
+{
+    QFile file(packagePath);
+    if (!file.open(QIODevice::ReadOnly)) {
+        fail(error, QStringLiteral("cannot open %1: %2").arg(packagePath, file.errorString()));
+        return SignatureCheck::Corrupt;
+    }
+
+    QCryptographicHash digest(QCryptographicHash::Sha256);
+    PackageInfo info;
+    if (!readHeader(file, &info, &digest, error, Container::Signed))
+        return SignatureCheck::Corrupt;
+
+    const QByteArray sizes = file.read(kSizesSize);
+    if (sizes.size() != kSizesSize) {
+        fail(error, QStringLiteral("truncated payload header"));
+        return SignatureCheck::Corrupt;
+    }
+    digest.addData(sizes);
+
+    const quint64 payloadCompressed = readU64(sizes.constData());
+    if (file.pos() + qint64(payloadCompressed) + kDigestSize + kSignatureSize != file.size()) {
+        fail(error, QStringLiteral("package is truncated or has trailing garbage"));
+        return SignatureCheck::Corrupt;
+    }
+
+    QByteArray buffer(kChunkSize, Qt::Uninitialized);
+    quint64 remaining = payloadCompressed;
+    while (remaining > 0) {
+        const qint64 got = file.read(buffer.data(), qMin<qint64>(buffer.size(), qint64(remaining)));
+        if (got <= 0) {
+            fail(error, QStringLiteral("truncated payload"));
+            return SignatureCheck::Corrupt;
+        }
+        digest.addData(QByteArrayView(buffer.constData(), got));
+        remaining -= quint64(got);
+    }
+
+    const QByteArray actualDigest = file.read(kDigestSize);
+    if (actualDigest != digest.result()) {
+        fail(error, QStringLiteral("package contents do not match its digest"));
+        return SignatureCheck::Corrupt;
+    }
+    return verifySignature(actualDigest, file.read(kSignatureSize)) ? SignatureCheck::Official
+                                                                      : SignatureCheck::Unverified;
+}
+
+bool install(const QString &packagePath, const QString &destDir, const ProgressFn &progress,
+             PackageInfo *installed, QString *error, Container container, bool requireSignature)
+{
+    const bool user = container == Container::User;
     QFile file(packagePath);
     if (!file.open(QIODevice::ReadOnly))
         return fail(error, QStringLiteral("cannot open %1: %2").arg(packagePath, file.errorString()));
 
     QCryptographicHash digest(QCryptographicHash::Sha256);
     PackageInfo info;
-    if (!readHeader(file, &info, &digest, error))
+    if (!readHeader(file, &info, &digest, error, container))
         return false;
 
     // Refused here rather than in the manager, because this is also the path a side-loaded file
-    // takes. A native-code package built for another platform installs perfectly and then fails to
-    // load, which is a much harder thing to explain than a refusal.
-    if (!info.platform.isEmpty() && info.platform != currentPlatform()) {
-        return fail(error, QStringLiteral("%1 is built for %2, but this is %3")
-                               .arg(info.id, info.platform, currentPlatform()));
-    }
+    // takes.
+    if (!checkCompatible(info, error))
+        return false;
 
     const QByteArray sizes = file.read(kSizesSize);
     if (sizes.size() != kSizesSize)
@@ -348,9 +479,11 @@ bool install(const QString &packagePath, const QString &destDir, const ProgressF
         tableTotal += entry.size;
     if (tableTotal != payloadRaw)
         return fail(error, QStringLiteral("file table does not account for the whole payload"));
+    if (user && payloadRaw > kMaxUserPayload)
+        return fail(error, QStringLiteral("package is too large"));
 
     const qint64 trailerStart = file.pos() + qint64(payloadCompressed);
-    if (trailerStart + kDigestSize + kSignatureSize != file.size())
+    if (trailerStart + kDigestSize + (user ? 0 : kSignatureSize) != file.size())
         return fail(error, QStringLiteral("package is truncated or has trailing garbage"));
 
     const QString stagingDir = destDir + QStringLiteral(".partial");
@@ -412,10 +545,9 @@ bool install(const QString &packagePath, const QString &destDir, const ProgressF
 
     const QByteArray expectedDigest = digest.result();
     const QByteArray actualDigest = file.read(kDigestSize);
-    const QByteArray signature = file.read(kSignatureSize);
     if (actualDigest != expectedDigest)
         return fail(error, QStringLiteral("package contents do not match its digest"));
-    if (!verifySignature(actualDigest, signature))
+    if (!user && requireSignature && !verifySignature(actualDigest, file.read(kSignatureSize)))
         return fail(error, QStringLiteral("package signature is not valid for this build of Drift"));
 
     QDir existing(destDir);
@@ -429,6 +561,88 @@ bool install(const QString &packagePath, const QString &destDir, const ProgressF
     guard.promoted = true;
     if (installed)
         *installed = info;
+    return true;
+}
+
+bool writeUserPackage(const QString &packageDir, const QString &kind, const QJsonObject &meta,
+                      const QString &outPath, QString *error)
+{
+    const QDir dir(packageDir);
+    const QString folder = dir.dirName();
+
+    QStringList relPaths;
+    QDirIterator it(packageDir, QDir::Files | QDir::NoDotAndDotDot, QDirIterator::Subdirectories);
+    while (it.hasNext())
+        relPaths.append(dir.relativeFilePath(it.next()));
+    relPaths.sort();
+    if (relPaths.isEmpty())
+        return fail(error, QStringLiteral("%1 has no files").arg(packageDir));
+
+    QByteArray payload;
+    QJsonArray files;
+    for (const QString &rel : std::as_const(relPaths)) {
+        QFile file(dir.filePath(rel));
+        if (!file.open(QIODevice::ReadOnly))
+            return fail(error, QStringLiteral("cannot read %1: %2").arg(file.fileName(), file.errorString()));
+        const QByteArray bytes = file.readAll();
+        files.append(QJsonObject{
+            {QStringLiteral("path"), kind + QLatin1Char('/') + folder + QLatin1Char('/') + rel},
+            {QStringLiteral("offset"), double(payload.size())},
+            {QStringLiteral("size"), double(bytes.size())},
+            {QStringLiteral("sha256"),
+             QString::fromLatin1(QCryptographicHash::hash(bytes, QCryptographicHash::Sha256).toHex())},
+        });
+        payload.append(bytes);
+    }
+    if (quint64(payload.size()) > kMaxUserPayload)
+        return fail(error, QStringLiteral("package is too large"));
+
+    QJsonObject root = meta;
+    root.insert(QStringLiteral("schema"), 1);
+    root.insert(QStringLiteral("platform"), QString());
+    root.insert(QStringLiteral("installedSize"), double(payload.size()));
+    root.insert(QStringLiteral("files"), files);
+    root.insert(QStringLiteral("provides"),
+                QJsonArray{QJsonObject{{QStringLiteral("kind"), kind},
+                                       {QStringLiteral("root"), kind},
+                                       {QStringLiteral("items"), 1}}});
+    if (!root.contains(QStringLiteral("minAppVersion")))
+        root.insert(QStringLiteral("minAppVersion"), QStringLiteral(DRIFT_VERSION));
+    const QByteArray metadata = QJsonDocument(root).toJson(QJsonDocument::Compact);
+
+    QByteArray compressed(qsizetype(ZSTD_compressBound(size_t(payload.size()))), Qt::Uninitialized);
+    const size_t packed = ZSTD_compress(compressed.data(), size_t(compressed.size()), payload.constData(),
+                                        size_t(payload.size()), 19);
+    if (ZSTD_isError(packed))
+        return fail(error, QStringLiteral("zstd error: %1").arg(QString::fromUtf8(ZSTD_getErrorName(packed))));
+    compressed.resize(qsizetype(packed));
+
+    QByteArray out(kUserMagic, sizeof(kUserMagic));
+    appendU32(&out, kFormatVersion);
+    appendU32(&out, quint32(metadata.size()));
+    out.append(metadata);
+    appendU64(&out, quint64(compressed.size()));
+    appendU64(&out, quint64(payload.size()));
+    out.append(compressed);
+    out.append(QCryptographicHash::hash(out, QCryptographicHash::Sha256));
+
+    if (!QDir().mkpath(QFileInfo(outPath).absolutePath()))
+        return fail(error, QStringLiteral("cannot create the parent of %1").arg(outPath));
+    const QString partial = outPath + QStringLiteral(".partial");
+    QFile file(partial);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate))
+        return fail(error, QStringLiteral("cannot write %1: %2").arg(partial, file.errorString()));
+    const bool written = file.write(out) == out.size();
+    file.close();
+    if (!written) {
+        QFile::remove(partial);
+        return fail(error, QStringLiteral("write failed: %1").arg(file.errorString()));
+    }
+    QFile::remove(outPath);
+    if (!QFile::rename(partial, outPath)) {
+        QFile::remove(partial);
+        return fail(error, QStringLiteral("cannot move %1 into place").arg(partial));
+    }
     return true;
 }
 

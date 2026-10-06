@@ -21,8 +21,15 @@ Column {
     property bool useSlider: false
     property real sliderFrom: 0
     property real sliderTo: 1
+    // Snaps the slider to multiples of this (whole-number effect params); 0 is continuous.
+    property real sliderStep: 0
     property bool percent: false
     property string unit: "" // e.g. "°" — appended to the numeric readout
+    // Show the slider readout in decibels with the percentage after it, for gain properties
+    // where dB is the scale the value is actually read on. Only meaningful with `percent`,
+    // and deliberately display-only: the stored value, the slider taper and typed input all
+    // stay linear amplitude.
+    property bool decibels: false
 
     // An animated property is tinted with its curve colour so the row, its chip and its curve on
     // the keyframe strip read as one series. Clicking the label switches the animation off without
@@ -43,6 +50,10 @@ Column {
     property int valueRevision: 0
     property bool editing: false
     property real liveValue: 0
+    // Set while another control (a preview handle, a twin slider) is dragging this property.
+    // Those drags skip tracksChanged, so propDef.def is stale until they commit and the value
+    // has to come from the engine.
+    property bool liveSynced: false
 
     readonly property var activeKey: {
         void valueRevision
@@ -50,15 +61,26 @@ Column {
     }
     readonly property real currentValue: {
         void valueRevision
+        void liveSynced
         void keyframeList
-        void EditorState.playheadSeconds
         return valueAtPlayhead()
     }
     readonly property real displayedValue: editing ? liveValue : currentValue
 
     function bumpValue() {
+        liveSynced = false
         valueRevision++
         syncEditors()
+    }
+
+    function matchesKey(keys) {
+        const key = propDef.key
+        for (let i = 0; i < keys.length; ++i) {
+            const k = keys[i]
+            if (k === key || (k.endsWith(".*") && key.startsWith(k.slice(0, -1))))
+                return true
+        }
+        return false
     }
 
     function syncEditors() {
@@ -90,21 +112,41 @@ Column {
         return unit.length > 0 ? body + unit : body
     }
 
+    function formatDb(v) {
+        if (v <= 0)
+            return "-∞ dB"
+        const db = 20 * Math.log10(v)
+        return (db > 0.05 ? "+" : "") + db.toFixed(1) + " dB"
+    }
+
+    // The slider's own readout. Kept separate from displayReadout because the typed-value
+    // popup uses that one for its range label, where "-∞ dB (0%)–+6.0 dB (200%)" is unreadable.
+    function sliderReadout(v) {
+        if (!decibels)
+            return displayReadout(v)
+        return formatDb(v) + " (" + Math.round(v * 100) + "%)"
+    }
+
     // Asks the engine rather than reimplementing evaluateAt here. This used to be a JS mirror
     // of the interpolation math that had to be kept in sync with Keyframe.h by hand — which
     // stopped being tractable once keys grew individual bezier tangents.
+    //
+    // The playhead is read only past the early returns, and as the inspector's throttled copy:
+    // a binding depends on what it actually read, so a row with no keys never re-evaluates for
+    // playback at all.
     function valueAtPlayhead() {
-        if (!keyframeList || keyframeList.length === 0)
+        if (!liveSynced && (!keyframeList || keyframeList.length === 0))
             return propDef.def
         return EditorState.propertyValueAt(EditorState.selectedTrack, EditorState.selectedClip,
-                                           propDef.key, EditorState.playheadSeconds, propDef.def)
+                                           propDef.key, EditorState.inspectorPlayheadSeconds,
+                                           propDef.def)
     }
 
     function keyframeAtPlayhead() {
-        if (!keyframeList)
+        if (!keyframeList || keyframeList.length === 0)
             return null
 
-        const t = EditorState.playheadSeconds
+        const t = EditorState.inspectorPlayheadSeconds
         const tolerance = 1 / 30
         let best = null
         for (let i = 0; i < keyframeList.length; ++i) {
@@ -134,7 +176,7 @@ Column {
     readonly property bool hasPrevKeyframe: {
         if (!keyframeList || keyframeList.length === 0)
             return false
-        const t = EditorState.playheadSeconds
+        const t = EditorState.inspectorPlayheadSeconds
         const tolerance = 1 / 30
         for (let i = 0; i < keyframeList.length; ++i) {
             if (keyframeList[i].seconds < t - tolerance)
@@ -146,7 +188,7 @@ Column {
     readonly property bool hasNextKeyframe: {
         if (!keyframeList || keyframeList.length === 0)
             return false
-        const t = EditorState.playheadSeconds
+        const t = EditorState.inspectorPlayheadSeconds
         const tolerance = 1 / 30
         for (let i = 0; i < keyframeList.length; ++i) {
             if (keyframeList[i].seconds > t + tolerance)
@@ -194,12 +236,24 @@ Column {
     Connections {
         target: EditorState
         function onSelectedClipDataChanged() { root.bumpValue() }
-        function onPlayheadSecondsChanged() { root.bumpValue() }
         function onTracksChanged() { root.bumpValue() }
+        function onClipPropertiesPreviewed(trackIndex, clipIndex, keys) {
+            if (root.editing || !root.matchesKey(keys))
+                return
+            root.liveSynced = true
+            root.valueRevision++
+            root.syncEditors()
+        }
+    }
+
+    Component.onDestruction: {
+        if (valueSlider.pressed)
+            EditorState.commitPreviewDrag()
     }
 
     Component.onCompleted: syncEditors()
     onKeyframeListChanged: bumpValue()
+    onCurrentValueChanged: syncEditors()
 
     Item {
         width: root.width
@@ -419,11 +473,13 @@ Column {
 
             ThemedSlider {
                 id: valueSlider
+                lockWhilePlaying: true
                 label: root.propDef.label
                 width: parent.width - readoutBox.width - parent.spacing
                 anchors.verticalCenter: parent.verticalCenter
                 from: root.sliderFrom
                 to: root.sliderTo
+                stepSize: root.sliderStep
                 // Keep the playhead/model binding off while pressed — same as
                 // PreviewPanel scrub — so preview ticks cannot fight the drag.
                 Binding on value {
@@ -432,7 +488,9 @@ Column {
                 }
                 onMoved: {
                     root.liveValue = value
-                    EditorState.showKeyframeGraphProperty(root.propDef.key)
+                    // Keyboard nudges arrive without a press.
+                    if (!pressed)
+                        EditorState.showKeyframeGraphProperty(root.propDef.key)
                     EditorState.previewSetClipKeyframe(
                         EditorState.selectedTrack, EditorState.selectedClip, root.propDef.key,
                         EditorState.playheadSeconds, value)
@@ -441,6 +499,7 @@ Column {
                     if (pressed) {
                         root.editing = true
                         root.liveValue = value
+                        EditorState.showKeyframeGraphProperty(root.propDef.key)
                         EditorState.beginPreviewDrag(qsTr("Edit %1").arg(root.propDef.label))
                     } else {
                         EditorState.commitPreviewDrag()
@@ -453,7 +512,11 @@ Column {
             // value, so clicking it opens a small editor to type one.
             Item {
                 id: readoutBox
-                width: Math.max(48, readout.implicitWidth + Theme.spacingMd * 2)
+                // The dB readout's width swings with the value ("0.0 dB (100%)" vs "-∞ dB
+                // (0%)"), and the slider is sized off this — so hold a floor wide enough for
+                // the longest form, or the track resizes under the thumb mid-drag.
+                width: Math.max(root.decibels ? 112 : 48,
+                                readout.implicitWidth + Theme.spacingMd * 2)
                 height: Theme.controlHeightSm
                 anchors.verticalCenter: parent.verticalCenter
 
@@ -474,7 +537,7 @@ Column {
                     anchors.rightMargin: Theme.spacingMd
                     anchors.verticalCenter: parent.verticalCenter
                     horizontalAlignment: Text.AlignRight
-                    text: root.displayReadout(root.displayedValue)
+                    text: root.sliderReadout(root.displayedValue)
                     color: Theme.panelForeground
                     font.family: Theme.monoFontFamily
                     font.pixelSize: Theme.fontSizeSm

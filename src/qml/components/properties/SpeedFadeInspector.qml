@@ -13,6 +13,10 @@ Item {
     }
     readonly property bool hasSelection: !!clipData && Object.keys(clipData).length > 0
     readonly property string clipKind: hasSelection ? (clipData.kind || "") : ""
+    readonly property bool speedKind: clipKind === "video" || clipKind === "audio" || clipKind === "composite"
+    // Composites (and audio separated from one) read a nested timeline, which the Custom speed
+    // preview and the reverse render cannot decode.
+    readonly property bool nestedSource: hasSelection && !!clipData.sequenceId
 
     height: speedColumn.height
     implicitHeight: speedColumn.height
@@ -32,16 +36,16 @@ Item {
         spacing: Theme.spacingXl
 
         EmptyState {
-            visible: root.clipKind !== "video" && root.clipKind !== "audio"
+            visible: !root.speedKind
             width: parent.width
             compact: true
             glyph: Theme.icons.gauge
             title: qsTr("Not available")
-            hint: qsTr("Speed applies to video and audio clips.")
+            hint: qsTr("Speed applies to video, audio and composite clips.")
         }
 
         Text {
-            visible: root.clipKind === "video" || root.clipKind === "audio"
+            visible: root.speedKind
             text: qsTr("Playback speed")
             color: Theme.mutedForeground
             font.family: Theme.fontFamily
@@ -58,9 +62,10 @@ Item {
         Row {
             width: parent.width
             spacing: 6
-            visible: root.clipKind === "video" || root.clipKind === "audio"
+            visible: root.speedKind
 
             ThemedButton {
+                visible: !root.nestedSource
                 text: qsTr("Custom speed…")
                 variant: "secondary"
                 onClicked: root.Window.window.openSpeedCurve(
@@ -80,7 +85,7 @@ Item {
             Row {
                 width: parent.width
                 spacing: 6
-                visible: root.clipKind === "video" || root.clipKind === "audio"
+                visible: root.speedKind
                 Repeater {
                     model: [
                         { label: "0.25×", value: 0.25 },
@@ -105,8 +110,8 @@ Item {
         ThemedSlider {
             id: speedSlider
             label: qsTr("Speed")
-            visible: root.clipKind === "video" || root.clipKind === "audio"
-            enabled: !speedColumn.hasSpeedCurve
+            visible: root.speedKind
+            enabled: !speedColumn.hasSpeedCurve && !EditorState.playing
             width: parent.width
             from: 0.25
             to: 4.0
@@ -126,7 +131,7 @@ Item {
         }
 
         Text {
-            visible: root.clipKind === "video" || root.clipKind === "audio"
+            visible: root.speedKind
             text: (speedColumn.hasSpeedCurve
                    ? qsTr("Custom speed")
                    : (root.clipData.speed || 1).toFixed(2) + "×")
@@ -137,7 +142,7 @@ Item {
         }
 
         ThemedChip {
-            visible: root.clipKind === "video" || root.clipKind === "audio"
+            visible: root.speedKind && !root.nestedSource
             text: qsTr("Reverse")
             selected: {
                 void root.clipDataRevision

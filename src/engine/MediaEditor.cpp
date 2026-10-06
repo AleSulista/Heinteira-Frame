@@ -8,23 +8,29 @@
 #include <QDir>
 #include <QFile>
 #include <QImage>
-#include <QImageReader>
+#include "StillImage.h"
+
 #include <QStandardPaths>
-#include <QTransform>
+#include <QStringList>
 #include <QUuid>
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <limits>
 #include <vector>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
+#include <libavfilter/avfilter.h>
+#include <libavfilter/buffersink.h>
+#include <libavfilter/buffersrc.h>
 #include <libavformat/avformat.h>
 #include <libavutil/audio_fifo.h>
 #include <libavutil/channel_layout.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/opt.h>
+#include <libavutil/pixdesc.h>
 #include <libavutil/samplefmt.h>
 #include <libswresample/swresample.h>
 #include <libswscale/swscale.h>
@@ -110,9 +116,7 @@ bool editImage(const MediaEditSpec &spec, QString *errorOut,
     if (cancelled(onProgress, 0.0))
         return fail(trEdit("Cancelled"));
 
-    QImageReader reader(spec.inputPath);
-    reader.setAutoTransform(true);
-    QImage image = reader.read();
+    const QImage image = drift::decodeStillImage(spec.inputPath);
     if (image.isNull())
         return fail(trEdit("Could not read that image"));
 
@@ -149,6 +153,149 @@ int64_t framePtsUs(const AVFrame *frame, AVRational timeBase)
     if (pts == AV_NOPTS_VALUE)
         return 0;
     return av_rescale_q(pts, timeBase, {1, AV_TIME_BASE});
+}
+
+// The nearest broadcast rate to `rate`, for conforming a variable-rate recording. Anything that
+// isn't close to one (a 120 fps slow-motion clip) keeps its own rate, rounded to a whole number.
+AVRational standardFrameRate(AVRational rate)
+{
+    static constexpr AVRational kRates[] = {{24000, 1001}, {24, 1}, {25, 1}, {30000, 1001},
+                                            {30, 1},       {50, 1}, {60000, 1001}, {60, 1}};
+    const double fps = av_q2d(rate);
+    AVRational best = kRates[0];
+    double bestDiff = std::numeric_limits<double>::max();
+    for (const AVRational candidate : kRates) {
+        const double diff = std::abs(av_q2d(candidate) - fps);
+        if (diff < bestDiff) {
+            bestDiff = diff;
+            best = candidate;
+        }
+    }
+    if (bestDiff / fps <= 0.03)
+        return best;
+    return AVRational{std::max(1, int(std::lround(fps))), 1};
+}
+
+int sourceBitDepth(const AVCodecContext *dec)
+{
+    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(dec->pix_fmt);
+    return desc ? desc->comp[0].depth : 8;
+}
+
+bool x264Supports(AVPixelFormat format)
+{
+    const AVCodec *codec = avcodec_find_encoder(AV_CODEC_ID_H264);
+    const void *configs = nullptr;
+    if (!codec
+        || avcodec_get_supported_config(nullptr, codec, AV_CODEC_CONFIG_PIX_FORMAT, 0, &configs,
+                                        nullptr)
+               < 0
+        || !configs)
+        return false;
+    for (auto *p = static_cast<const AVPixelFormat *>(configs); *p != AV_PIX_FMT_NONE; ++p) {
+        if (*p == format)
+            return true;
+    }
+    return false;
+}
+
+QStringList rotationChain(int rotation)
+{
+    if (rotation == 90)
+        return {QStringLiteral("transpose=clock")};
+    if (rotation == 180)
+        return {QStringLiteral("hflip,vflip")};
+    if (rotation == 270)
+        return {QStringLiteral("transpose=cclock")};
+    return {};
+}
+
+// buffer (source frames, microsecond timestamps) -> `chain` -> buffersink.
+bool buildFilterGraph(const AVCodecContext *dec, const AVStream *stream, const QString &chain,
+                      const QList<FilterOption> &options, AVFilterGraph **graphOut,
+                      AVFilterContext **srcOut, AVFilterContext **sinkOut)
+{
+    AVFilterGraph *graph = avfilter_graph_alloc();
+    if (!graph)
+        return false;
+
+    AVRational sar = dec->sample_aspect_ratio;
+    if (sar.num <= 0 || sar.den <= 0)
+        sar = stream->sample_aspect_ratio;
+    if (sar.num <= 0 || sar.den <= 0)
+        sar = AVRational{1, 1};
+    const QByteArray args =
+        QStringLiteral("video_size=%1x%2:pix_fmt=%3:time_base=1/%4:pixel_aspect=%5/%6"
+                       ":colorspace=%7:range=%8")
+            .arg(dec->width)
+            .arg(dec->height)
+            .arg(int(dec->pix_fmt))
+            .arg(AV_TIME_BASE)
+            .arg(sar.num)
+            .arg(sar.den)
+            .arg(int(dec->colorspace))
+            .arg(int(dec->color_range))
+            .toUtf8();
+
+    AVFilterContext *src = nullptr;
+    AVFilterContext *sink = nullptr;
+    bool ok = avfilter_graph_create_filter(&src, avfilter_get_by_name("buffer"), "in",
+                                           args.constData(), nullptr, graph)
+            >= 0
+        && avfilter_graph_create_filter(&sink, avfilter_get_by_name("buffersink"), "out", nullptr,
+                                        nullptr, graph)
+            >= 0;
+
+    // avfilter_graph_parse_ptr in its steps, so `options` land after the chain's own options and
+    // before init: a filter refuses a non-runtime option once it is initialized.
+    AVFilterGraphSegment *segment = nullptr;
+    AVFilterInOut *freeInputs = nullptr;
+    AVFilterInOut *freeOutputs = nullptr;
+    if (ok) {
+        const QByteArray chainUtf8 = chain.toUtf8();
+        ok = avfilter_graph_segment_parse(graph, chainUtf8.constData(), 0, &segment) >= 0
+            && avfilter_graph_segment_create_filters(segment, 0) >= 0
+            && avfilter_graph_segment_apply_opts(segment, 0) >= 0;
+    }
+    for (const FilterOption &option : options) {
+        if (!ok)
+            break;
+        bool applied = false;
+        for (size_t c = 0; ok && c < segment->nb_chains; ++c) {
+            const AVFilterChain *filterChain = segment->chains[c];
+            for (size_t f = 0; f < filterChain->nb_filters; ++f) {
+                AVFilterContext *ctx = filterChain->filters[f]->filter;
+                if (!ctx || option.filter != ctx->filter->name)
+                    continue;
+                if (av_opt_set(ctx, option.option.constData(), option.value.toUtf8().constData(),
+                               AV_OPT_SEARCH_CHILDREN)
+                    < 0) {
+                    ok = false;
+                    break;
+                }
+                applied = true;
+            }
+        }
+        ok = ok && applied;
+    }
+    // The chain is one unlabeled run, so it leaves exactly one free pad at each end.
+    ok = ok && avfilter_graph_segment_init(segment, 0) >= 0
+        && avfilter_graph_segment_link(segment, 0, &freeInputs, &freeOutputs) >= 0
+        && freeInputs && !freeInputs->next && freeOutputs && !freeOutputs->next
+        && avfilter_link(src, 0, freeInputs->filter_ctx, freeInputs->pad_idx) >= 0
+        && avfilter_link(freeOutputs->filter_ctx, freeOutputs->pad_idx, sink, 0) >= 0
+        && avfilter_graph_config(graph, nullptr) >= 0;
+    avfilter_inout_free(&freeInputs);
+    avfilter_inout_free(&freeOutputs);
+    avfilter_graph_segment_free(&segment);
+    if (!ok) {
+        avfilter_graph_free(&graph);
+        return false;
+    }
+    *graphOut = graph;
+    *srcOut = src;
+    *sinkOut = sink;
+    return true;
 }
 
 bool editAudio(const MediaEditSpec &spec, QString *errorOut,
@@ -321,44 +468,18 @@ bool editAudio(const MediaEditSpec &spec, QString *errorOut,
                                     : (ok ? fail(trEdit("Nothing to keep")) : false);
 }
 
-QImage frameToImage(const AVFrame *frame, SwsContext **swsCache, int rotation)
-{
-    int scaledW = frame->width;
-    int scaledH = frame->height;
-    if (rotation == 90 || rotation == 270)
-        std::swap(scaledW, scaledH);
-
-    *swsCache = sws_getCachedContext(*swsCache, frame->width, frame->height,
-                                     static_cast<AVPixelFormat>(frame->format), scaledW, scaledH,
-                                     AV_PIX_FMT_RGB24, SWS_BILINEAR, nullptr, nullptr, nullptr);
-    if (!*swsCache)
-        return {};
-
-    AVFrame *rgb = av_frame_alloc();
-    if (!rgb)
-        return {};
-    rgb->format = AV_PIX_FMT_RGB24;
-    rgb->width = scaledW;
-    rgb->height = scaledH;
-    if (av_frame_get_buffer(rgb, 0) < 0) {
-        av_frame_free(&rgb);
-        return {};
-    }
-    sws_scale(*swsCache, frame->data, frame->linesize, 0, frame->height, rgb->data, rgb->linesize);
-    QImage image(rgb->data[0], scaledW, scaledH, rgb->linesize[0], QImage::Format_RGB888);
-    const QImage copy = rotation == 0 ? image.copy() : image.transformed(QTransform().rotate(rotation));
-    av_frame_free(&rgb);
-    return copy;
-}
-
 class Mp4Writer
 {
 public:
     ~Mp4Writer() { abort(); }
 
-    bool open(const QString &path, int width, int height, AVRational frameRate,
+    // Size, pixel format, aspect and colour tags all come from the first frame the filter graph
+    // produced, so they describe exactly what gets encoded.
+    bool open(const QString &path, const AVFrame *firstVideo, AVRational frameRate,
               bool withAudio, int audioRate, QString *errorOut);
-    bool writeVideo(const QImage &image, QString *errorOut);
+    bool isOpen() const { return m_fmt != nullptr; }
+    // pts in 1/frameRate units.
+    bool writeVideo(AVFrame *frame, QString *errorOut);
     bool writeAudio(const float *interleaved, int frames, QString *errorOut);
     bool finish(QString *errorOut);
     void abort();
@@ -376,22 +497,18 @@ private:
     AVCodecContext *m_audioCtx = nullptr;
     AVStream *m_videoStream = nullptr;
     AVStream *m_audioStream = nullptr;
-    AVFrame *m_videoFrame = nullptr;
     AVFrame *m_audioFrame = nullptr;
     AVPacket *m_pkt = nullptr;
-    SwsContext *m_sws = nullptr;
     AVAudioFifo *m_fifo = nullptr;
     QString m_path;
     QString m_tmpPath;
-    int64_t m_videoPts = 0;
+    int64_t m_lastVideoPts = INT64_MIN;
     int64_t m_audioPts = 0;
     int m_audioRate = 48000;
-    int m_width = 0;
-    int m_height = 0;
     bool m_finished = false;
 };
 
-bool Mp4Writer::open(const QString &path, int width, int height, AVRational frameRate,
+bool Mp4Writer::open(const QString &path, const AVFrame *firstVideo, AVRational frameRate,
                      bool withAudio, int audioRate, QString *errorOut)
 {
     auto fail = [&](const QString &message) {
@@ -403,8 +520,6 @@ bool Mp4Writer::open(const QString &path, int width, int height, AVRational fram
 
     m_path = path;
     m_tmpPath = path + QStringLiteral(".part");
-    m_width = width;
-    m_height = height;
     m_audioRate = audioRate > 0 ? audioRate : 48000;
     if (QFile::exists(m_tmpPath))
         QFile::remove(m_tmpPath);
@@ -429,22 +544,33 @@ bool Mp4Writer::open(const QString &path, int width, int height, AVRational fram
     if (frameRate.num <= 0 || frameRate.den <= 0)
         frameRate = AVRational{30, 1};
 
-    m_videoCtx->width = width;
-    m_videoCtx->height = height;
-    m_videoCtx->pix_fmt = AV_PIX_FMT_YUV420P;
+    m_videoCtx->width = firstVideo->width;
+    m_videoCtx->height = firstVideo->height;
+    m_videoCtx->pix_fmt = static_cast<AVPixelFormat>(firstVideo->format);
+    m_videoCtx->sample_aspect_ratio = firstVideo->sample_aspect_ratio;
+    m_videoCtx->color_range = firstVideo->color_range;
+    m_videoCtx->colorspace = firstVideo->colorspace;
+    m_videoCtx->color_primaries = firstVideo->color_primaries;
+    m_videoCtx->color_trc = firstVideo->color_trc;
     m_videoCtx->time_base = AVRational{frameRate.den, frameRate.num};
     m_videoCtx->framerate = frameRate;
-    m_videoCtx->gop_size = 12;
-    m_videoCtx->max_b_frames = 0;
+    // The result is timeline media: a keyframe about every second keeps a scrub's seek to a
+    // second of decoding at most. B-frames and CRF 18 are what keep the file near the size of a
+    // camera original — CRF 16 with a 12-frame GOP and no B-frames ran 1080p at ~45 Mbps.
+    m_videoCtx->gop_size = std::max(1, int(std::lround(av_q2d(frameRate))));
+    m_videoCtx->max_b_frames = 3;
     if (m_fmt->oformat->flags & AVFMT_GLOBALHEADER)
         m_videoCtx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+    // It replaces the original in the project and is what export reads, so still visually
+    // lossless.
     av_opt_set(m_videoCtx->priv_data, "crf", "18", 0);
-    av_opt_set(m_videoCtx->priv_data, "preset", "veryfast", 0);
+    av_opt_set(m_videoCtx->priv_data, "preset", "fast", 0);
 
     if (avcodec_open2(m_videoCtx, vCodec, nullptr) < 0)
         return fail(trEdit("Could not open the video encoder"));
     avcodec_parameters_from_context(m_videoStream->codecpar, m_videoCtx);
     m_videoStream->time_base = m_videoCtx->time_base;
+    m_videoStream->sample_aspect_ratio = m_videoCtx->sample_aspect_ratio;
     m_videoStream->avg_frame_rate = frameRate;
     m_videoStream->r_frame_rate = frameRate;
 
@@ -491,14 +617,8 @@ bool Mp4Writer::open(const QString &path, int width, int height, AVRational fram
         return fail(trEdit("Could not write the output header"));
 
     m_pkt = av_packet_alloc();
-    m_videoFrame = av_frame_alloc();
-    if (!m_pkt || !m_videoFrame)
+    if (!m_pkt)
         return fail(trEdit("Could not allocate encoder buffers"));
-    m_videoFrame->format = AV_PIX_FMT_YUV420P;
-    m_videoFrame->width = width;
-    m_videoFrame->height = height;
-    if (av_frame_get_buffer(m_videoFrame, 0) < 0)
-        return fail(trEdit("Could not allocate a video frame"));
     return true;
 }
 
@@ -550,32 +670,15 @@ bool Mp4Writer::drainAudio(QString *errorOut)
     }
 }
 
-bool Mp4Writer::writeVideo(const QImage &image, QString *errorOut)
+bool Mp4Writer::writeVideo(AVFrame *frame, QString *errorOut)
 {
-    if (image.isNull()) {
-        if (errorOut)
-            *errorOut = trEdit("Could not convert a frame");
-        return false;
-    }
-    const QImage rgb = image.convertToFormat(QImage::Format_RGB888);
-    m_sws = sws_getCachedContext(m_sws, rgb.width(), rgb.height(), AV_PIX_FMT_RGB24, m_width,
-                                 m_height, AV_PIX_FMT_YUV420P, SWS_BILINEAR, nullptr, nullptr,
-                                 nullptr);
-    if (!m_sws) {
-        if (errorOut)
-            *errorOut = trEdit("Could not convert a frame for the encoder");
-        return false;
-    }
-    if (av_frame_make_writable(m_videoFrame) < 0) {
-        if (errorOut)
-            *errorOut = trEdit("Could not make the video frame writable");
-        return false;
-    }
-    const uint8_t *srcSlice[1] = {rgb.constBits()};
-    int srcStride[1] = {static_cast<int>(rgb.bytesPerLine())};
-    sws_scale(m_sws, srcSlice, srcStride, 0, rgb.height(), m_videoFrame->data, m_videoFrame->linesize);
-    m_videoFrame->pts = m_videoPts++;
-    if (avcodec_send_frame(m_videoCtx, m_videoFrame) < 0) {
+    // x264 rejects a non-advancing timestamp; the fps filter never repeats one, but a stray
+    // duplicate must not abort an otherwise fine edit.
+    if (frame->pts <= m_lastVideoPts)
+        frame->pts = m_lastVideoPts + 1;
+    m_lastVideoPts = frame->pts;
+    frame->pict_type = AV_PICTURE_TYPE_NONE;
+    if (avcodec_send_frame(m_videoCtx, frame) < 0) {
         if (errorOut)
             *errorOut = trEdit("Video encoder rejected a frame");
         return false;
@@ -708,16 +811,10 @@ void Mp4Writer::abort()
 
 void Mp4Writer::teardown()
 {
-    if (m_sws) {
-        sws_freeContext(m_sws);
-        m_sws = nullptr;
-    }
     if (m_fifo) {
         av_audio_fifo_free(m_fifo);
         m_fifo = nullptr;
     }
-    if (m_videoFrame)
-        av_frame_free(&m_videoFrame);
     if (m_audioFrame)
         av_frame_free(&m_audioFrame);
     if (m_pkt)
@@ -778,12 +875,15 @@ bool editVideo(const MediaEditSpec &spec, QString *errorOut,
         return fail(trEdit("The video has no usable size"));
     }
 
-    const int rotation = displayRotationOf(vStream);
+    const int rotation = spec.rotationOverride >= 0 ? spec.rotationOverride : displayRotationOf(vStream);
     int displayW = vDec->width;
     int displayH = vDec->height;
     if (rotation == 90 || rotation == 270)
         std::swap(displayW, displayH);
-    QRect crop = pixelCropRect(displayW, displayH, spec.cropX, spec.cropY, spec.cropW, spec.cropH);
+    QRect crop = cropIsFull(spec.cropX, spec.cropY, spec.cropW, spec.cropH)
+        ? QRect()
+        : pixelCropRect(displayW, displayH, spec.cropX, spec.cropY, spec.cropW, spec.cropH);
+    // yuv420 needs even dimensions; a full frame with an odd edge loses that one row or column.
     if (!crop.isValid())
         crop = QRect(0, 0, displayW & ~1, displayH & ~1);
     if (crop.width() < 2 || crop.height() < 2) {
@@ -797,14 +897,25 @@ bool editVideo(const MediaEditSpec &spec, QString *errorOut,
         frameRate = vStream->r_frame_rate;
     if (frameRate.num <= 0 || frameRate.den <= 0)
         frameRate = AVRational{30, 1};
+    if (spec.conformFrameRate) {
+        // A recording that sagged in low light averages well under the rate it was shot at;
+        // r_frame_rate is FFmpeg's read of the base rate the timestamps sit on, which is that one.
+        // Only trusted in a plausible range — some muxers report the time base there.
+        const AVRational base = vStream->r_frame_rate;
+        if (base.num > 0 && base.den > 0 && av_q2d(base) <= 121.0
+            && av_q2d(base) >= av_q2d(frameRate))
+            frameRate = base;
+        frameRate = standardFrameRate(frameRate);
+    }
 
     const TimeUs inUs = secondsToUs(std::max(0.0, spec.inSeconds));
-    TimeUs outUs = spec.outSeconds < 0 ? 0 : secondsToUs(spec.outSeconds);
+    // "Through the end" is unbounded rather than the container's duration: that figure is only
+    // an estimate, and on a variable-rate file it can fall short of the last frame.
+    const TimeUs outUs = spec.outSeconds < 0 ? std::numeric_limits<TimeUs>::max()
+                                             : secondsToUs(spec.outSeconds);
     const TimeUs durationUs = fmt->duration > 0 ? fmt->duration
                                                 : av_rescale_q(vStream->duration, vStream->time_base,
                                                                {1, AV_TIME_BASE});
-    if (outUs <= 0)
-        outUs = durationUs > 0 ? durationUs : std::numeric_limits<TimeUs>::max();
     if (outUs <= inUs) {
         avcodec_free_context(&vDec);
         avformat_close_input(&fmt);
@@ -836,17 +947,45 @@ bool editVideo(const MediaEditSpec &spec, QString *errorOut,
         }
     }
 
-    Mp4Writer writer;
-    if (!writer.open(spec.outputPath, crop.width(), crop.height(), frameRate, aDec != nullptr, 48000,
-                     errorOut)) {
-        if (swr)
-            swr_free(&swr);
-        if (aDec)
-            avcodec_free_context(&aDec);
-        avcodec_free_context(&vDec);
-        avformat_close_input(&fmt);
-        return false;
+    const bool tenBit = !spec.frameHook && sourceBitDepth(vDec) > 8
+        && x264Supports(AV_PIX_FMT_YUV420P10LE);
+    const AVPixelFormat outFormat = tenBit ? AV_PIX_FMT_YUV420P10LE : AV_PIX_FMT_YUV420P;
+    // With a hook the graph hands over RGB for it, and the hook's result is converted to
+    // outFormat on the way to the encoder.
+    const AVPixelFormat graphFormat = spec.frameHook ? AV_PIX_FMT_RGB24 : outFormat;
+
+    AVFilterGraph *graph = nullptr;
+    AVFilterContext *filterSrc = nullptr;
+    AVFilterContext *filterSink = nullptr;
+    {
+        QStringList chain = rotationChain(rotation);
+        if (!spec.videoFilter.isEmpty())
+            chain << spec.videoFilter;
+        if (crop != QRect(0, 0, displayW, displayH))
+            chain << QStringLiteral("crop=%1:%2:%3:%4:exact=1")
+                         .arg(crop.width())
+                         .arg(crop.height())
+                         .arg(crop.x())
+                         .arg(crop.y());
+        // start_time=0 pads from the trim's in-point, so a first frame that lands late still
+        // lines up with the audio's first sample.
+        chain << QStringLiteral("fps=fps=%1/%2:start_time=0").arg(frameRate.num).arg(frameRate.den)
+              << QStringLiteral("format=%1").arg(QString::fromLatin1(av_get_pix_fmt_name(graphFormat)));
+        if (!buildFilterGraph(vDec, vStream, chain.join(QLatin1Char(',')), spec.videoFilterOptions,
+                              &graph, &filterSrc, &filterSink)) {
+            if (swr)
+                swr_free(&swr);
+            if (aDec)
+                avcodec_free_context(&aDec);
+            avcodec_free_context(&vDec);
+            avformat_close_input(&fmt);
+            return fail(trEdit("Could not set up the video conversion"));
+        }
     }
+
+    Mp4Writer writer;
+    SwsContext *hookSws = nullptr;
+    AVFrame *hooked = spec.frameHook ? av_frame_alloc() : nullptr;
 
     if (inUs > 0) {
         const int64_t ts = av_rescale_q(inUs, {1, AV_TIME_BASE}, vStream->time_base);
@@ -858,18 +997,24 @@ bool editVideo(const MediaEditSpec &spec, QString *errorOut,
 
     AVPacket *packet = av_packet_alloc();
     AVFrame *frame = av_frame_alloc();
-    SwsContext *rgbSws = nullptr;
+    AVFrame *filtered = av_frame_alloc();
     std::vector<float> pcm;
-    bool ok = true;
+    // Audio decoded before the first filtered video frame opens the writer.
+    std::vector<float> pendingPcm;
+    bool ok = packet && frame && filtered && (hooked || !spec.frameHook);
     bool wroteVideo = false;
-    const TimeUs spanUs = outUs == std::numeric_limits<TimeUs>::max() ? 0 : (outUs - inUs);
-    TimeUs lastVideoUs = inUs;
+    // Set once a stream decodes past the out-point; with both set, the rest of the file is skipped.
+    bool videoPastOut = false;
+    bool audioPastOut = false;
+    const TimeUs spanUs = (outUs == std::numeric_limits<TimeUs>::max() ? durationUs : outUs) - inUs;
 
     auto cleanup = [&] {
-        if (rgbSws)
-            sws_freeContext(rgbSws);
+        av_frame_free(&hooked);
+        sws_freeContext(hookSws);
+        av_frame_free(&filtered);
         av_frame_free(&frame);
         av_packet_free(&packet);
+        avfilter_graph_free(&graph);
         if (swr)
             swr_free(&swr);
         if (aDec)
@@ -878,24 +1023,115 @@ bool editVideo(const MediaEditSpec &spec, QString *errorOut,
         avformat_close_input(&fmt);
     };
 
+    auto writeAudio = [&](const float *interleaved, int count) -> bool {
+        if (!writer.isOpen()) {
+            pendingPcm.insert(pendingPcm.end(), interleaved, interleaved + count * 2);
+            return true;
+        }
+        return writer.writeAudio(interleaved, count, errorOut);
+    };
+
+    auto drainFilter = [&]() -> bool {
+        for (;;) {
+            const int rc = av_buffersink_get_frame(filterSink, filtered);
+            if (rc == AVERROR(EAGAIN) || rc == AVERROR_EOF)
+                return true;
+            if (rc < 0)
+                return fail(trEdit("Could not convert a frame"));
+            if (spec.frameHook) {
+                QImage image(filtered->width, filtered->height, QImage::Format_RGB888);
+                for (int y = 0; y < filtered->height; ++y)
+                    std::memcpy(image.scanLine(y), filtered->data[0] + y * filtered->linesize[0],
+                                size_t(filtered->width) * 3);
+                QString hookError;
+                if (!spec.frameHook(image, &hookError)) {
+                    av_frame_unref(filtered);
+                    return fail(hookError.isEmpty() ? trEdit("Cancelled") : hookError);
+                }
+                // yuv420 needs even dimensions.
+                const int w = image.width() & ~1;
+                const int h = image.height() & ~1;
+                if (writer.isOpen() && (w != hooked->width || h != hooked->height)) {
+                    av_frame_unref(filtered);
+                    return fail(trEdit("Could not convert a frame"));
+                }
+                if (!hooked->data[0]) {
+                    hooked->format = outFormat;
+                    hooked->width = w;
+                    hooked->height = h;
+                    if (av_frame_get_buffer(hooked, 0) < 0) {
+                        av_frame_unref(filtered);
+                        return fail(trEdit("Could not convert a frame"));
+                    }
+                }
+                hookSws = sws_getCachedContext(hookSws, w, h, AV_PIX_FMT_RGB24, w, h, outFormat,
+                                               SWS_BICUBIC, nullptr, nullptr, nullptr);
+                if (!hookSws || av_frame_make_writable(hooked) < 0) {
+                    av_frame_unref(filtered);
+                    return fail(trEdit("Could not convert a frame"));
+                }
+                // The hook's picture is plain RGB; encode it as limited-range BT.709 and say so.
+                const int *bt709 = sws_getCoefficients(SWS_CS_ITU709);
+                sws_setColorspaceDetails(hookSws, bt709, 1, bt709, 0, 0, 1 << 16, 1 << 16);
+                const uint8_t *srcData[1] = {image.constBits()};
+                const int srcStride[1] = {int(image.bytesPerLine())};
+                sws_scale(hookSws, srcData, srcStride, 0, h, hooked->data, hooked->linesize);
+                hooked->pts = filtered->pts;
+                hooked->duration = filtered->duration;
+                hooked->color_range = AVCOL_RANGE_MPEG;
+                hooked->colorspace = AVCOL_SPC_BT709;
+                hooked->color_primaries = filtered->color_primaries;
+                hooked->color_trc = filtered->color_trc;
+                hooked->sample_aspect_ratio = filtered->sample_aspect_ratio;
+                av_frame_unref(filtered);
+                // The writer takes its size from the first frame it sees, and unrefs nothing, so
+                // hand it a reference and keep the buffer for the next frame.
+                av_frame_ref(filtered, hooked);
+            }
+            if (!writer.isOpen()) {
+                // Primaries and transfer ride the stream, not every decoded frame; without them an
+                // HDR source would come out tagged as SDR.
+                if (filtered->color_primaries == AVCOL_PRI_UNSPECIFIED)
+                    filtered->color_primaries = vDec->color_primaries;
+                if (filtered->color_trc == AVCOL_TRC_UNSPECIFIED)
+                    filtered->color_trc = vDec->color_trc;
+                if (!writer.open(spec.outputPath, filtered, frameRate, aDec != nullptr, 48000,
+                                 errorOut)) {
+                    av_frame_unref(filtered);
+                    return false;
+                }
+                if (!pendingPcm.empty()
+                    && !writer.writeAudio(pendingPcm.data(), int(pendingPcm.size() / 2), errorOut)) {
+                    av_frame_unref(filtered);
+                    return false;
+                }
+                pendingPcm.clear();
+            }
+            const bool written = writer.writeVideo(filtered, errorOut);
+            av_frame_unref(filtered);
+            if (!written)
+                return false;
+            wroteVideo = true;
+        }
+    };
+
     auto handleVideo = [&](AVFrame *decoded) -> bool {
         const TimeUs ptsUs = framePtsUs(decoded, vStream->time_base);
         if (ptsUs + 1000 < inUs)
             return true;
-        if (ptsUs >= outUs)
+        if (ptsUs >= outUs) {
+            videoPastOut = true;
             return true;
-        QImage image = frameToImage(decoded, &rgbSws, rotation);
-        if (image.isNull())
-            return fail(trEdit("Could not convert a frame"));
-        if (!cropIsFull(spec.cropX, spec.cropY, spec.cropW, spec.cropH)) {
-            image = image.copy(crop);
-            if (image.isNull())
-                return fail(trEdit("The crop left nothing to save"));
         }
-        if (!writer.writeVideo(image, errorOut))
+        // Real timestamps into the fps filter, relative to the in-point: it is what places each
+        // frame on the output grid, instead of the frames simply being counted.
+        decoded->pts = ptsUs - inUs;
+        // Same time base as pts, or the filter holds the clip's last frame for a sliver of it.
+        decoded->duration = av_rescale_q(decoded->duration, vStream->time_base, {1, AV_TIME_BASE});
+        if (av_buffersrc_add_frame_flags(filterSrc, decoded, AV_BUFFERSRC_FLAG_KEEP_REF) < 0)
+            return fail(trEdit("Could not convert a frame"));
+        if (!drainFilter())
             return false;
-        wroteVideo = true;
-        lastVideoUs = ptsUs;
         if (spanUs > 0 && cancelled(onProgress, double(ptsUs - inUs) / double(spanUs))) {
             if (errorOut)
                 *errorOut = trEdit("Cancelled");
@@ -911,8 +1147,10 @@ bool editVideo(const MediaEditSpec &spec, QString *errorOut,
         const TimeUs ptsUs = framePtsUs(decoded, aStream->time_base);
         if (ptsUs + 20000 < inUs)
             return true;
-        if (ptsUs >= outUs)
+        if (ptsUs >= outUs) {
+            audioPastOut = true;
             return true;
+        }
         const int maxOut = swr_get_out_samples(swr, decoded->nb_samples);
         pcm.resize(std::max(0, maxOut) * 2);
         uint8_t *outData[1] = {reinterpret_cast<uint8_t *>(pcm.data())};
@@ -939,10 +1177,10 @@ bool editVideo(const MediaEditSpec &spec, QString *errorOut,
         }
         if (count <= 0)
             return true;
-        return writer.writeAudio(pcm.data() + offset * 2, count, errorOut);
+        return writeAudio(pcm.data() + offset * 2, count);
     };
 
-    while (ok) {
+    while (ok && !(videoPastOut && (audioPastOut || !aDec || !swr))) {
         if (av_read_frame(fmt, packet) < 0)
             break;
         AVCodecContext *dec = nullptr;
@@ -987,6 +1225,10 @@ bool editVideo(const MediaEditSpec &spec, QString *errorOut,
             if (!ok)
                 break;
         }
+        if (ok) {
+            // Flushes the fps filter's held frame, the clip's last.
+            ok = av_buffersrc_add_frame_flags(filterSrc, nullptr, 0) >= 0 && drainFilter();
+        }
         if (ok && aDec) {
             avcodec_send_packet(aDec, nullptr);
             for (;;) {
@@ -1013,11 +1255,174 @@ bool editVideo(const MediaEditSpec &spec, QString *errorOut,
     cleanup();
     if (ok && onProgress)
         onProgress(1.0);
-    (void)lastVideoUs;
     return ok;
 }
 
 } // namespace
+
+bool analyzeVideo(const QString &inputPath, TimeUs inUs, TimeUs outUs, const QString &filter,
+                  const QList<FilterOption> &filterOptions, QString *errorOut,
+                  const std::function<bool(double)> &onProgress)
+{
+    auto fail = [&](const QString &message) {
+        if (errorOut)
+            *errorOut = message;
+        return false;
+    };
+
+    AVFormatContext *fmt = nullptr;
+    const QByteArray pathUtf8 = inputPath.toUtf8();
+    if (avformat_open_input(&fmt, pathUtf8.constData(), nullptr, nullptr) < 0)
+        return fail(trEdit("Could not open the video"));
+    if (avformat_find_stream_info(fmt, nullptr) < 0) {
+        avformat_close_input(&fmt);
+        return fail(trEdit("Could not read the video"));
+    }
+
+    const int videoIndex = av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+    if (videoIndex < 0) {
+        avformat_close_input(&fmt);
+        return fail(trEdit("That file has no video"));
+    }
+
+    AVStream *vStream = fmt->streams[videoIndex];
+    const AVCodec *vDecCodec = avcodec_find_decoder(vStream->codecpar->codec_id);
+    AVCodecContext *vDec = vDecCodec ? avcodec_alloc_context3(vDecCodec) : nullptr;
+    if (vDec)
+        vDec->thread_count = 0;
+    if (!vDec || avcodec_parameters_to_context(vDec, vStream->codecpar) < 0
+        || avcodec_open2(vDec, vDecCodec, nullptr) < 0) {
+        if (vDec)
+            avcodec_free_context(&vDec);
+        avformat_close_input(&fmt);
+        return fail(trEdit("Could not decode the video"));
+    }
+
+    QStringList chain = rotationChain(displayRotationOf(vStream));
+    chain << filter;
+    AVFilterGraph *graph = nullptr;
+    AVFilterContext *filterSrc = nullptr;
+    AVFilterContext *filterSink = nullptr;
+    if (!buildFilterGraph(vDec, vStream, chain.join(QLatin1Char(',')), filterOptions, &graph,
+                          &filterSrc, &filterSink)) {
+        avcodec_free_context(&vDec);
+        avformat_close_input(&fmt);
+        return fail(trEdit("Could not set up the video analysis"));
+    }
+
+    inUs = std::max<TimeUs>(0, inUs);
+    if (outUs < 0)
+        outUs = std::numeric_limits<TimeUs>::max();
+    const TimeUs durationUs = fmt->duration > 0 ? fmt->duration
+                                                : av_rescale_q(vStream->duration, vStream->time_base,
+                                                               {1, AV_TIME_BASE});
+    const TimeUs spanUs = (outUs == std::numeric_limits<TimeUs>::max() ? durationUs : outUs) - inUs;
+    if (inUs > 0) {
+        const int64_t ts = av_rescale_q(inUs, {1, AV_TIME_BASE}, vStream->time_base);
+        av_seek_frame(fmt, videoIndex, ts, AVSEEK_FLAG_BACKWARD);
+        avcodec_flush_buffers(vDec);
+    }
+    AVPacket *packet = av_packet_alloc();
+    AVFrame *frame = av_frame_alloc();
+    AVFrame *filtered = av_frame_alloc();
+    bool ok = packet && frame && filtered;
+    int framesAnalyzed = 0;
+    bool pastOut = false;
+
+    auto drainFilter = [&]() -> bool {
+        for (;;) {
+            const int rc = av_buffersink_get_frame(filterSink, filtered);
+            if (rc == AVERROR(EAGAIN) || rc == AVERROR_EOF)
+                return true;
+            if (rc < 0)
+                return fail(trEdit("Could not analyze a frame"));
+            av_frame_unref(filtered);
+        }
+    };
+
+    // Same seek, timestamp handling and trim as editVideo's handleVideo, so both passes feed the
+    // filter the same frames.
+    auto handleVideo = [&](AVFrame *decoded) -> bool {
+        const TimeUs ptsUs = framePtsUs(decoded, vStream->time_base);
+        if (ptsUs + 1000 < inUs)
+            return true;
+        if (ptsUs >= outUs) {
+            pastOut = true;
+            return true;
+        }
+        decoded->pts = ptsUs - inUs;
+        decoded->duration = av_rescale_q(decoded->duration, vStream->time_base, {1, AV_TIME_BASE});
+        if (av_buffersrc_add_frame_flags(filterSrc, decoded, AV_BUFFERSRC_FLAG_KEEP_REF) < 0)
+            return fail(trEdit("Could not analyze a frame"));
+        ++framesAnalyzed;
+        if (!drainFilter())
+            return false;
+        if (spanUs > 0 && cancelled(onProgress, double(ptsUs - inUs) / double(spanUs)))
+            return fail(trEdit("Cancelled"));
+        return true;
+    };
+
+    auto receiveAll = [&]() -> bool {
+        for (;;) {
+            const int rc = avcodec_receive_frame(vDec, frame);
+            if (rc == AVERROR(EAGAIN) || rc == AVERROR_EOF)
+                return true;
+            if (rc < 0)
+                return fail(trEdit("Could not decode the video"));
+            const bool handled = handleVideo(frame);
+            av_frame_unref(frame);
+            if (!handled)
+                return false;
+        }
+    };
+
+    while (ok && !pastOut && av_read_frame(fmt, packet) >= 0) {
+        if (packet->stream_index != videoIndex) {
+            av_packet_unref(packet);
+            continue;
+        }
+        const int send = avcodec_send_packet(vDec, packet);
+        av_packet_unref(packet);
+        if (send < 0 && send != AVERROR(EAGAIN))
+            continue;
+        ok = receiveAll();
+    }
+    if (ok) {
+        avcodec_send_packet(vDec, nullptr);
+        ok = receiveAll();
+    }
+    if (ok)
+        ok = av_buffersrc_add_frame_flags(filterSrc, nullptr, 0) >= 0 && drainFilter();
+    if (ok && framesAnalyzed == 0)
+        ok = fail(trEdit("No frames could be decoded from this clip"));
+
+    av_frame_free(&filtered);
+    av_frame_free(&frame);
+    av_packet_free(&packet);
+    // vidstabdetect writes its result file as the graph is torn down.
+    avfilter_graph_free(&graph);
+    avcodec_free_context(&vDec);
+    avformat_close_input(&fmt);
+    if (ok && onProgress)
+        onProgress(1.0);
+    return ok;
+}
+
+bool hasVideoFilter(const char *name)
+{
+    return avfilter_get_by_name(name) != nullptr;
+}
+
+QString stabilizationCacheDir()
+{
+    const QString root = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+    if (root.isEmpty())
+        return {};
+    const QString dir = QDir(root).filePath(QStringLiteral("stabilization"));
+    if (!QDir().mkpath(dir))
+        return {};
+    return dir;
+}
 
 QString newEditedMediaPath(const QString &projectId, const QString &kind)
 {

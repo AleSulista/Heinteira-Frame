@@ -89,6 +89,157 @@
     </screenshot>
   </screenshots>
   <releases>
+    <release version="0.7.5" date="2026-10-05">
+      <url type="details">https://github.com/CutWire-Studios/Drift/releases/tag/v0.7.5</url>
+      <description>
+        <p>A bug-fix release that stops the crashes on Intel graphics when scrubbing
+        hardware-decoded video. It also brings a Face Retouch effect, AI video upscaling,
+        speed control for composite clips and a batch of smaller fixes and additions.</p>
+        <ul>
+          <li>Fixed crashes in the Intel media driver (iHD) when scrubbing hardware-decoded
+          video in the preview</li>
+          <li>Face Retouch: a beauty effect for smoothing skin, reshaping and lip and skin tone
+          colour, with a numbered face picker and support for still images</li>
+          <li>Enhance video: upscale clips with a choice of models, with trim and crop before
+          upscaling and a live frame preview</li>
+          <li>Speed adjustment for composite clips</li>
+          <li>Animated GIFs import as video and play on the timeline</li>
+          <li>Stabilized clips are rendered into the media bin as their own assets</li>
+          <li>Save media bin assets back out as files</li>
+          <li>Eye toggle to hide adjustment tracks, and nested adjustment lanes</li>
+          <li>Custom effects: new parameter types (2D points, choice lists, whole numbers and
+          colours with alpha), keyframable colours and toggles, a My Effects filter and audio
+          effects in .driftfx packages, which can now be imported directly</li>
+          <li>Install add-ons from .driftpkg or .zip files and from a custom add-ons folder</li>
+          <li>Market: a Sound Effects tab, asset variations and back buttons that stay in
+          place while scrolling</li>
+          <li>MCP: agents can create, update, delete and export custom effects, transitions and
+          audio effects</li>
+          <li>macOS: a native system menu bar, and install through Homebrew</li>
+          <li>Available on the Microsoft Store and Google Play</li>
+          <li>Fixes: effects work on people cutouts, ripple on edge trims, zoom-aware snapping,
+          sized SVGs scale to the clip and keep their CSS styles, the market catalog reloads
+          when its tab opens, package textures are no longer flipped, proxies no longer fill up
+          the temp folder, and image export on Android</li>
+          <li>Translations: Korean, Polish and Portuguese (Portugal) added; Japanese and
+          Vietnamese updated</li>
+        </ul>
+        <p>Thanks to @rangaNP for the macOS menu bar and the Homebrew cask; to @mildannerofc for
+        Korean and Portuguese (Portugal); to Paweł Korobajło for Polish; to @coolvitto for
+        Japanese; and to @tojidotakarin for Vietnamese.</p>
+      </description>
+    </release>
+    <release version="0.7.0" date="2026-09-28">
+      <url type="details">https://github.com/CutWire-Studios/Drift/releases/tag/v0.7.0</url>
+      <description>
+        <p>Huge performance improvements across the timeline, preview and playback, with the UI
+        lag gone. Import 3D objects, light scenes with Studio Relight and depth effects, and tilt
+        clips with 3D transforms. A redesigned audio mixer, recording straight onto the timeline,
+        and proxy editing for heavy footage round out the release.</p>
+        <ul>
+          <li>Transcript-first editing: word-level transcripts with speaker detection, cut by
+          deleting words, remove silences, and audio transitions</li>
+          <li>Composite clips: nest clips into a single clip you can move, trim and reuse</li>
+          <li>Transform layers: move, scale, rotate, tilt and fade several tracks as one
+          (Ctrl+G), with a bracket in the track headers showing what the layer covers</li>
+          <li>3D clip transforms with tilt, depth and perspective, and a move, rotate and scale
+          gizmo in global or local space</li>
+          <li>Import 3D models (.glb) as clips, and face props for the face effects</li>
+          <li>Depth effects: 3D relight, depth of field, fog and occlusion driven by estimated
+          video depth, and Behind Subject for placing graphics behind people</li>
+          <li>Voiceover recording from the microphone onto a track, with live waveforms, gain,
+          mic selection and pause</li>
+          <li>Redesigned audio mixer: resizable docked panel with per-track and master strips,
+          pan knobs, stereo meters and a pinned master</li>
+          <li>Proxy editing, and a Convert to CFR option for variable frame rate phone footage</li>
+          <li>Non-destructive source framing to crop and reframe a video inside its clip</li>
+          <li>Videos with an alpha channel keep their transparency</li>
+          <li>Custom preview guides: build guide sets, drag guides on the preview and snap to
+          them</li>
+          <li>Subtitles: generate for a selection of clips, merge subtitles, and a smoother
+          editing workflow</li>
+          <li>A start screen for opening or starting a project, a full-project overview strip
+          above the timeline, a transform scale slider, and dropping media straight from the
+          file manager onto the timeline</li>
+          <li>A themed colour picker with an in-window eyedropper, and the chroma key colour
+          picked from the Effects card</li>
+          <li>Market: Drift Assets as the home page, a stock browser across all sources, detail
+          panels that slide over, and a remembered download folder</li>
+          <li>Performance: a GPU-drawn timeline, lighter trims and drags, lower memory use,
+          smoother transitions during playback and hardware decoding for every clip once it is
+          proven to work</li>
+          <li>Android: faster timeline scrubbing, touch-first clip gestures, drag and drop for
+          every asset, in-process stabilization, and safer names for imported files</li>
+          <li>Audio fixes: the Limiter limits instead of adding gain, loudness and true peak are
+          measured to the standard so Normalise no longer clips, and ducking keeps the music's
+          own volume</li>
+          <li>Fixes: splitting keeps effects and animation on both halves, imported media is
+          centred on the canvas, pinned effects stay on their own clip during transitions, the
+          Duotone effect renders again, the preview no longer flashes on slow GPUs, and arrow
+          keys jog the playhead on Wayland</li>
+          <li>Nightly builds, AppImage update information, a warning for unsupported graphics
+          drivers, and an Agent access option that starts on launch with a persistent token</li>
+          <li>Translations: Arabic and Colombian Spanish added; Japanese, Spanish, Vietnamese,
+          French (Canada) and Sinhala updated</li>
+        </ul>
+        <p>Thanks to @jmn8718 for the start screen, the timeline overview strip, source framing,
+        the Agent start-on-launch option and decoder and addon install fixes; to @gelvezz23 for the chroma key tab and Colombian Spanish; to @dratiux for
+        Arabic; to @coolvitto for Japanese; to @tojidotakarin for Vietnamese; to @CathodeAnode for
+        French (Canada); and to Loposmo for Spanish.</p>
+      </description>
+    </release>
+    <release version="0.6.0" date="2026-09-13">
+      <url type="details">https://github.com/CutWire-Studios/Drift/releases/tag/v0.6.0</url>
+      <description>
+        <p>Text and shapes are redrawn through Skia with layered styles, gradients and a new
+        animation engine, Lottie and SVG clips arrive on the timeline, over a hundred new
+        transitions land in the add-ons catalog, and Windows gets a Direct3D zero-copy path
+        with fixes for NVIDIA stutter.</p>
+        <ul>
+          <li>Text styles: fill, stroke, shadow, glow and extrude layers with solid, gradient,
+          texture or shader paints, a Looks gallery (Neon, Chrome, Holographic, Glitch, Outline,
+          Echo and more), curved baselines and keyframable size, tracking and layer settings</li>
+          <li>Text animations: per-character, word or line animators with In, Out and Loop
+          preset galleries — typewriter, type-on blur, rise by word, snap together, glitch,
+          flicker, colour wave, wipe, karaoke pop and bounce, and 40 more</li>
+          <li>Shapes share the same style stack: gradient fills, multiple strokes, shadows,
+          glows and dashes, all keyframable so shapes can animate</li>
+          <li>Lottie (.lottie, .json) and SVG files import as vector clips, with a Motion
+          inspector for editing slots, playback options and poster frames</li>
+          <li>100+ new GPU transitions ported from gl-transitions, available through the add-ons
+          catalog, plus easing curves for every transition</li>
+          <li>In-app Marketplace for browsing and downloading stock media, with a separate
+          download-queue window</li>
+          <li>Adjustment layers in the Effects tab; masks are now keyframeable adjustment layers
+          with on-canvas handles and their own Masks tab</li>
+          <li>Cutouts via Robust Video Matting, and Paste Attributes with selective picking
+          across multi-clip selections</li>
+          <li>Windows: Direct3D 11 zero-copy decoding and a GPU switcher for hybrid laptops;
+          fixed CUDA zero-copy and CUDA/OpenGL interop stutter on NVIDIA, hybrid-GPU decode,
+          display-cadence stutter and the black preview on software OpenGL; new playback
+          diagnostics and a warning for hardware-acceleration settings that will not work on
+          the current machine</li>
+          <li>Audio: multi-channel waveform view, decibel volume control, multi-track audio
+          extraction, and separate-audio / unlink actions on the timeline</li>
+          <li>Media bin: tree view, Import Folder, nested folder moves, multi-select with
+          Shift-click ranges and bulk actions, safe removal of in-use media, lossless 90°
+          rotation correction and non-destructive trimming from the bin</li>
+          <li>Android: hardware-accelerated video decoding and a reworked mobile layout</li>
+          <li>Save As, track renaming, select-all-and-move, keyboard delete, Shift+Arrow
+          frame-by-frame scrubbing, native shortcut labels on macOS, and settings moved into
+          a dialog</li>
+          <li>MCP: headless CLI mode, text, shape and motion-graphics tools, and lower token
+          usage</li>
+          <li>Translations: Tagalog and Vietnamese added; Japanese and Spanish updated</li>
+        </ul>
+        <p>Thanks to @jmn8718 for lossless rotation correction, Import Folder, track renaming
+        and the media bin multi-select and folder moves; to @gorio for safe media removal,
+        keyboard delete, separate-audio and unlink actions, track numbering and native macOS
+        shortcuts; to @TSFBCE24RhythmHeaveners for the Tagalog translation; to @tojidotakarin
+        for Vietnamese; to @coolvitto for Japanese; and to @angelreyesvelazquezjesus-gif for
+        Spanish.</p>
+      </description>
+    </release>
     <release version="0.5.1" date="2026-08-31">
       <url type="details">https://github.com/CutWire-Studios/Drift/releases/tag/v0.5.1</url>
       <description>

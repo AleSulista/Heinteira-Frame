@@ -3,6 +3,7 @@
 #include <QHash>
 #include <QJsonObject>
 #include <QObject>
+#include <QUrl>
 #include <QPointer>
 #include <QVariantList>
 
@@ -36,7 +37,8 @@ public:
 
     // One row per known addon: id, name, description, details, author, license, kind, version,
     // installedVersion, downloadSize, installedSize, items, state.
-    // state is one of: available, downloading, installing, installed, update-available, failed.
+    // state is one of: available, downloading, installing, installed, update-available, failed,
+    // needs-newer-app (minAppVersion is above this build; also sets minAppVersion on the row).
     QVariantList catalog() const;
     QString status() const;
     bool refreshing() const;
@@ -64,6 +66,35 @@ public:
     Q_INVOKABLE QVariantList missingEssentialAddons() const;
     // Installed packs with a newer version on the store.
     Q_INVOKABLE QVariantList updatableAddons() const;
+
+    // --- User packages (.driftfx from Drift Forge) ---------------------------------------
+    // Copies the picked file (a content:// URI on Android) into the cache and reads its manifest.
+    // Returns name, kind ("effects" | "transitions"), version, author and description, or a map
+    // with only `error`. Nothing is installed until installUserPackage(), which acts on the file
+    // inspected last and answers on userPackageInstalled.
+    Q_INVOKABLE QVariantMap inspectUserPackage(const QUrl &url);
+    // Sniffs the magic, since a content:// URI from "Open with" rarely carries the file name.
+    Q_INVOKABLE bool isUserPackage(const QUrl &url) const;
+    Q_INVOKABLE void installUserPackage();
+    // --- Addons from a file (.driftpkg, .zip, or a .driftfx routed to the above) ------------
+    // Reads what the file claims to be and refuses it if this build cannot use it. Returns type
+    // ("driftpkg" | "zip" | "driftfx"), name, version, author, description, nativeCode and
+    // replaces (the name of an installed addon or store pack with the same id), or only `error`.
+    // A "driftfx" result has gone through inspectUserPackage() and follows that flow instead.
+    Q_INVOKABLE QVariantMap inspectAddonFile(const QUrl &url);
+    // Installs the file inspected last. An officially signed .driftpkg installs straight away;
+    // anything else emits addonFileNeedsConfirmation() until called again with acceptUnverified.
+    // Answers on userPackageInstalled.
+    Q_INVOKABLE void installAddonFile(bool acceptUnverified);
+    Q_INVOKABLE void discardAddonFile();
+    // customAddonsDir(), created if missing so the file manager has something to open.
+    Q_INVOKABLE QUrl customAddonsFolderUrl() const;
+    // Picks up folders added to or removed from the custom directory since the last look.
+    Q_INVOKABLE void rescanCustomAddons();
+
+    // Reload the catalogs behind these addon kinds and emit kindChanged for each, which is what
+    // refreshes the browsers. Also used by MCP after it writes a package straight to disk.
+    void reloadForKinds(const QStringList &kinds);
 
     // --- Acceleration ------------------------------------------------------------------
     // Whether an ONNX Runtime is installed at all. Every AI feature needs one, so this gates
@@ -96,6 +127,11 @@ signals:
     // these exist to let callers react to an outcome without reading its prose.
     void transferFailed(const QString &id, const QString &reason);
     void transferSucceeded(const QString &id);
+    // Outcome of installUserPackage(); `error` is empty on success.
+    void userPackageInstalled(const QString &name, const QString &error);
+    // The file from inspectAddonFile() is not signed by the Drift team; the UI asks before
+    // calling installAddonFile(true) or discardAddonFile().
+    void addonFileNeedsConfirmation();
 
 private:
     struct Transfer;
@@ -107,7 +143,6 @@ private:
     void finishDownload(const QString &id);
     void beginExtract(const QString &id, const QString &packagePath);
     void failTransfer(const QString &id, const QString &message);
-    void reloadForKinds(const QStringList &kinds);
     void sweepDownloadCache();
 
     QString m_status;
@@ -121,5 +156,15 @@ private:
     QStringList m_awaitingFreshIndex;
     QSet<QString> m_retried;
     bool m_runtimeRestartRequired = false;
+    QString m_userPackagePath;
+    QString m_addonFilePath;
+    QString m_addonFileType; // "driftpkg" | "zip"
+    // Inside the zip: "" or "<top folder>/", whichever holds manifest.json.
+    QString m_addonFileZipPrefix;
+    QString m_addonFileId;
+    QString m_addonFileName;
+    // False when m_addonFilePath is the user's own file rather than a copy in the cache.
+    bool m_addonFileOwned = false;
+    bool m_addonFileBusy = false;
     QNetworkAccessManager *m_network = nullptr;
 };

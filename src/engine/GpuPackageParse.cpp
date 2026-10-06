@@ -7,9 +7,12 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QJsonArray>
 #include <QRegularExpression>
 #include <QSet>
 #include <QStandardPaths>
+
+#include <algorithm>
 
 namespace GpuPackageParse {
 
@@ -134,13 +137,75 @@ bool parseParameters(const QJsonArray &params, QList<drift::EffectParamSpec> *ou
             spec.type = drift::EffectParamType::Color;
         else if (type == QLatin1String("file"))
             spec.type = drift::EffectParamType::FilePath;
-        else
+        else if (type == QLatin1String("clip"))
+            spec.type = drift::EffectParamType::Clip;
+        else if (type == QLatin1String("point") || type == QLatin1String("vec2"))
+            spec.type = drift::EffectParamType::Vec2;
+        else if (type == QLatin1String("choice") || type == QLatin1String("enum"))
+            spec.type = drift::EffectParamType::Enum;
+        else if (type == QLatin1String("int") || type == QLatin1String("integer"))
+            spec.type = drift::EffectParamType::Int;
+        else if (type == QLatin1String("float") || type == QLatin1String("number"))
             spec.type = drift::EffectParamType::Float;
-        spec.min = p.value(QStringLiteral("minValue")).toDouble(p.value(QStringLiteral("min")).toDouble(0.0));
-        spec.max = p.value(QStringLiteral("maxValue")).toDouble(p.value(QStringLiteral("max")).toDouble(1.0));
-        spec.defaultValue =
-            p.value(QStringLiteral("defaultValue")).toDouble(p.value(QStringLiteral("default")).toDouble(0.0));
+        else {
+            // An unknown type must not quietly become a float: that is how a colour param ends up
+            // binding 0.0 to a vec3 uniform and rendering the frame black. But refusing the package
+            // outright would take an already-installed effect away from someone who has it working
+            // — effects.trending shipped duotone with type "string" and hex defaults. So infer the
+            // colour when the default says plainly that it is one, and only refuse what cannot be
+            // read at all.
+            const QString declared = p.value(QStringLiteral("defaultValue")).toString().isEmpty()
+                ? p.value(QStringLiteral("default")).toString()
+                : p.value(QStringLiteral("defaultValue")).toString();
+            if (declared.startsWith(QLatin1Char('#')) && QColor(declared).isValid()) {
+                qWarning("GpuPackageParse: parameter '%s' has unknown type '%s'; reading it as a "
+                         "colour from its default. Declare it as \"color\".",
+                         qUtf8Printable(spec.key), qUtf8Printable(type));
+                spec.type = drift::EffectParamType::Color;
+            } else {
+                fail(errorOut,
+                     QStringLiteral("parameter '%1' has unknown type '%2'").arg(spec.key, type));
+                return false;
+            }
+        }
+        // A point carries its range as [min, min] / [max, max]; the axes share one range here.
+        const auto scalarOrFirst = [](const QJsonValue &v, double fallback) {
+            if (v.isArray())
+                return v.toArray().isEmpty() ? fallback : v.toArray().first().toDouble(fallback);
+            return v.toDouble(fallback);
+        };
+        const QJsonValue minV = p.contains(QStringLiteral("minValue")) ? p.value(QStringLiteral("minValue"))
+                                                                       : p.value(QStringLiteral("min"));
+        const QJsonValue maxV = p.contains(QStringLiteral("maxValue")) ? p.value(QStringLiteral("maxValue"))
+                                                                       : p.value(QStringLiteral("max"));
+        spec.min = scalarOrFirst(minV, 0.0);
+        spec.max = scalarOrFirst(maxV, 1.0);
+        const QJsonValue defV = p.contains(QStringLiteral("defaultValue")) ? p.value(QStringLiteral("defaultValue"))
+                                                                           : p.value(QStringLiteral("default"));
+        if (spec.type == drift::EffectParamType::Vec2) {
+            const QJsonArray xy = defV.toArray();
+            spec.defaultX = xy.size() > 0 ? xy.at(0).toDouble(0.0) : 0.0;
+            spec.defaultY = xy.size() > 1 ? xy.at(1).toDouble(0.0) : 0.0;
+        } else {
+            spec.defaultValue = defV.toDouble(0.0);
+        }
+        spec.step = p.value(QStringLiteral("step")).toDouble(
+            p.value(QStringLiteral("ui")).toObject().value(QStringLiteral("step")).toDouble(0.0));
+        if (spec.type == drift::EffectParamType::Int)
+            spec.step = 1.0;
+        if (spec.type == drift::EffectParamType::Enum) {
+            for (const QJsonValue &o : p.value(QStringLiteral("options")).toArray())
+                spec.options.append(o.toString());
+            if (spec.options.size() < 2) {
+                fail(errorOut, QStringLiteral("parameter '%1' needs at least two options").arg(spec.key));
+                return false;
+            }
+            spec.min = 0.0;
+            spec.max = spec.options.size() - 1;
+        }
         spec.desktopGlOnly = p.value(QStringLiteral("desktopGlOnly")).toBool(false);
+        spec.group = p.value(QStringLiteral("group")).toString();
+        spec.groupCollapsed = p.value(QStringLiteral("groupCollapsed")).toBool(false);
 
         if (spec.key.isEmpty()) {
             fail(errorOut, QStringLiteral("parameter missing identifier"));
@@ -150,16 +215,40 @@ bool parseParameters(const QJsonArray &params, QList<drift::EffectParamSpec> *ou
             QString hex = p.value(QStringLiteral("defaultValue")).toString();
             if (hex.isEmpty())
                 hex = p.value(QStringLiteral("default")).toString();
-            const QColor color(hex);
-            if (!hex.startsWith(QLatin1Char('#')) || !color.isValid()) {
+            spec.alpha = p.value(QStringLiteral("alpha")).toBool(false);
+            // Package hex is CSS-style #rrggbbaa; Qt reads 8 digits as #aarrggbb, so split it.
+            int alpha = 255;
+            QString rgbHex = hex;
+            if (spec.alpha && hex.size() == 9 && hex.startsWith(QLatin1Char('#'))) {
+                bool ok = false;
+                alpha = hex.right(2).toInt(&ok, 16);
+                if (!ok)
+                    alpha = 255;
+                rgbHex = hex.left(7);
+            }
+            const QColor color(rgbHex);
+            if (!rgbHex.startsWith(QLatin1Char('#')) || !color.isValid()) {
                 fail(errorOut, QStringLiteral("parameter '%1' has an invalid colour default '%2'")
                                    .arg(spec.key, hex));
                 return false;
             }
             // Normalized here so the project file, the swatch and the uniform all agree on one
-            // spelling. Alpha is dropped on purpose: colours bind as vec3, and a package that
-            // wants transparency declares a separate opacity float.
+            // spelling. Alpha survives only when the param declares "alpha": true, as
+            // #rrggbbaa, which binds as a vec4; otherwise it is dropped and the colour is a vec3.
             spec.defaultColorHex = color.name(QColor::HexRgb);
+            if (spec.alpha)
+                spec.defaultColorHex += QStringLiteral("%1").arg(alpha, 2, 16, QLatin1Char('0'));
+            for (const QJsonValue &sv : p.value(QStringLiteral("swatches")).toArray()) {
+                const QString swatch = sv.toString();
+                const QColor c(swatch);
+                if (!swatch.startsWith(QLatin1Char('#')) || !c.isValid()) {
+                    fail(errorOut, QStringLiteral("parameter '%1' has an invalid swatch '%2'")
+                                       .arg(spec.key, swatch));
+                    return false;
+                }
+                spec.swatches.append(c.name(QColor::HexRgb));
+            }
+            spec.enables = p.value(QStringLiteral("enables")).toString();
         } else if (spec.type == drift::EffectParamType::FilePath) {
             QString def = p.value(QStringLiteral("defaultValue")).toString();
             if (def.isEmpty())
@@ -178,12 +267,25 @@ bool parseParameters(const QJsonArray &params, QList<drift::EffectParamSpec> *ou
         }
         // File params are never GPU uniforms — skip the reserved-name check for them so a
         // package can still call a file param something that would collide as a uniform.
-        if (gpuBackend && !spec.isFilePath() && drift::isReservedGpuUniform(spec.key)) {
+        if (gpuBackend && !spec.isFilePath() && !spec.isClip()
+            && drift::isReservedGpuUniform(spec.key)) {
             fail(errorOut,
                  QStringLiteral("parameter '%1' collides with reserved uniform").arg(spec.key));
             return false;
         }
         out->append(spec);
+    }
+    for (const drift::EffectParamSpec &spec : std::as_const(*out)) {
+        if (spec.enables.isEmpty())
+            continue;
+        const bool found = std::any_of(out->cbegin(), out->cend(), [&](const drift::EffectParamSpec &o) {
+            return o.key == spec.enables && o.isBoolean();
+        });
+        if (!found) {
+            fail(errorOut, QStringLiteral("parameter '%1' enables '%2', which is not a bool parameter")
+                               .arg(spec.key, spec.enables));
+            return false;
+        }
     }
     return true;
 }
@@ -313,6 +415,38 @@ bool loadGpuPipeline(const QJsonObject &root, const QString &packageDir, int max
             && !bufferIds.contains(pass.output.bufferId)) {
             fail(errorOut, QStringLiteral("pass output references unknown buffer '%1'")
                                .arg(pass.output.bufferId));
+            return false;
+        }
+
+        const QString geometry = p.value(QStringLiteral("geometry")).toString(QStringLiteral("quad"));
+        if (geometry == QLatin1String("face111")) {
+            // The mesh only covers the face, so the pass has to start from a copy of a frame
+            // rather than a static texture.
+            if (pass.inputs.first().type == drift::GpuEffectPassInput::Type::Texture) {
+                fail(errorOut,
+                     QStringLiteral("face111 pass %1 needs a source or buffer as input 0").arg(index));
+                return false;
+            }
+            if (maxSourceIndex > 0) {
+                fail(errorOut, QStringLiteral("face111 passes are only supported in effects"));
+                return false;
+            }
+            const QJsonArray bounds = p.value(QStringLiteral("templateBounds")).toArray();
+            if (bounds.size() != 4) {
+                fail(errorOut,
+                     QStringLiteral("face111 pass %1 needs templateBounds [x, y, w, h]").arg(index));
+                return false;
+            }
+            pass.templateBounds = QRectF(bounds.at(0).toDouble(), bounds.at(1).toDouble(),
+                                         bounds.at(2).toDouble(), bounds.at(3).toDouble());
+            if (!(pass.templateBounds.width() > 0.0) || !(pass.templateBounds.height() > 0.0)) {
+                fail(errorOut,
+                     QStringLiteral("face111 pass %1 templateBounds needs a positive size").arg(index));
+                return false;
+            }
+            pass.geometry = drift::GpuEffectPass::Geometry::Face111;
+        } else if (geometry != QLatin1String("quad")) {
+            fail(errorOut, QStringLiteral("pass %1 has unknown geometry '%2'").arg(index).arg(geometry));
             return false;
         }
 

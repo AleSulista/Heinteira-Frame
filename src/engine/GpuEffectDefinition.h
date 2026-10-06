@@ -2,6 +2,7 @@
 
 #include <QList>
 #include <QMetaType>
+#include <QRectF>
 #include <QString>
 #include <QVector>
 
@@ -26,9 +27,15 @@ inline bool isEngineBoundGpuUniform(const QString &name)
     if (name == QLatin1String("u_resolution") || name == QLatin1String("u_time")
         || name == QLatin1String("u_timeUs") || name == QLatin1String("u_frameIndex")
         || name == QLatin1String("u_currentTexture") || name == QLatin1String("u_progress")
-        || name == QLatin1String("u_fromTexture") || name == QLatin1String("u_toTexture")) {
+        || name == QLatin1String("u_fromTexture") || name == QLatin1String("u_toTexture")
+        || name == QLatin1String("u_hasDepth") || name == QLatin1String("u_templateBounds")
+        || name == QLatin1String("u_clipMask") || name == QLatin1String("u_hasClipMask")
+        || name == QLatin1String("u_meshAspect")) {
         return true;
     }
+    // The depth map and its size, bound for "requires": "depth" packages.
+    if (name.startsWith(QLatin1String("u_depth")))
+        return true;
     // Extra samplers bound for multi-input passes: u_texture1, u_texture2, ...
     return name.startsWith(QLatin1String("u_texture"));
 }
@@ -73,11 +80,19 @@ struct GpuEffectPassOutput
 
 struct GpuEffectPass
 {
+    // Quad covers the output. Face111 copies input 0 into the output, then draws GPUPixel's
+    // 111-point face mesh over it from u_faceLandmarks111, so a template image painted against
+    // the reference face lands on the tracked one. Effects with "requires": "face" only.
+    enum class Geometry { Quad, Face111 };
+
     int passIndex = 0;
     QString fragmentShaderFile;   // relative filename from the package JSON
     QString fragmentShaderSource; // loaded GLSL
     QList<GpuEffectPassInput> inputs;
     GpuEffectPassOutput output;
+    Geometry geometry = Geometry::Quad;
+    // Face111: where the template image sits on the reference face, in its 1280-pixel frame.
+    QRectF templateBounds;
 };
 
 // Parsed, validated GPU package pipeline (effect.json / transition.json + shaders).
@@ -87,6 +102,13 @@ struct GpuEffectDefinition
     QList<GpuEffectBufferSpec> intermediateBuffers;
     QList<GpuEffectTextureSpec> textures;
     QList<GpuEffectPass> passes;
+    // "requires": "depth": the depth prelude is compiled into every pass and the clip's depth map
+    // is bound beside the declared inputs. See docs/gpu-effects.md.
+    bool needsDepth = false;
+    // "requires": "mask": the mask prelude is compiled into every pass and the clip's folded mask
+    // stack is bound beside the declared inputs. The package consumes the masks: the clip is no
+    // longer cut out by them. See docs/gpu-effects.md.
+    bool needsMask = false;
     bool valid = false;
     QString errorMessage;
 };
